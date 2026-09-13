@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+stats.db
+formula_cache/
+backup_before_formula_images/
+.claude/
+local_config.py
