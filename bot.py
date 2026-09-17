@@ -38,6 +38,7 @@ if not BOT_TOKEN:
 
 DB_PATH = "stats.db"
 OPTION_LETTERS = ["А", "Б", "В", "Г", "Д", "Е"]
+CHANNEL_URL = "https://t.me/nicholas_physics"
 
 QUIZ_BUTTON = "🧮 Квиз"
 STATS_BUTTON = "📊 Статистика"
@@ -131,6 +132,15 @@ async def cmd_start(message: Message) -> None:
         "и сразу получай разбор с правильной формулой.\n\n"
         "Пользуйся кнопками внизу 👇",
         reply_markup=MAIN_KEYBOARD,
+    )
+
+    channel_builder = InlineKeyboardBuilder()
+    channel_builder.button(text="📢 Перейти в канал", url=CHANNEL_URL)
+    await message.answer(
+        "Кстати — если готовишься к ЕГЭ по физике, загляни на канал "
+        "<b>@nicholas_physics</b>: разборы задач, формулы, лайфхаки и мотивация, "
+        "чтобы не сдуться на финишной прямой 💪",
+        reply_markup=channel_builder.as_markup(),
     )
 
 
@@ -326,14 +336,15 @@ async def finish_quiz(callback: CallbackQuery) -> None:
 
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 К списку вопросов", callback_data="map")
-    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="📢 Канал с разборами и мотивацией", url=CHANNEL_URL))
 
     await callback.message.answer(
         f"🏁 <b>Итог по разделу «{section['title']}»</b>\n\n"
         f"{progress_bar(score, total)}\n"
         f"Результат: <b>{score}/{total}</b> ({percentage}%){note}\n\n"
         f"{result_tier(percentage)}\n\n"
-        f"Выбери другой раздел — кнопка 🧮 Квиз",
+        f"Выбери другой раздел — кнопка 🧮 Квиз\n"
+        f"А чтобы не терять мотивацию между тренировками — подпишись на @nicholas_physics 👇",
         reply_markup=builder.as_markup(),
     )
 
