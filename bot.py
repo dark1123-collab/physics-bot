@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import sqlite3
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -39,6 +40,7 @@ if not BOT_TOKEN:
 DB_PATH = "stats.db"
 OPTION_LETTERS = ["А", "Б", "В", "Г", "Д", "Е"]
 CHANNEL_URL = "https://t.me/nicholas_physics"
+ADMIN_ID = 881618387
 
 QUIZ_BUTTON = "🧮 Квиз"
 STATS_BUTTON = "📊 Статистика"
@@ -68,6 +70,33 @@ def init_db() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            full_name TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        )
+        """
+    )
+    existing_columns = [row[1] for row in conn.execute("PRAGMA table_info(answers)")]
+    if "created_at" not in existing_columns:
+        conn.execute("ALTER TABLE answers ADD COLUMN created_at TEXT")
+    conn.commit()
+    conn.close()
+
+
+def touch_user(user_id: int, full_name: str) -> None:
+    now = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO users (user_id, full_name, first_seen, last_seen) VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET last_seen = excluded.last_seen, full_name = excluded.full_name
+        """,
+        (user_id, full_name, now, now),
+    )
     conn.commit()
     conn.close()
 
@@ -75,11 +104,43 @@ def init_db() -> None:
 def record_answer(user_id: int, section: str, correct: bool) -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO answers (user_id, section, correct) VALUES (?, ?, ?)",
-        (user_id, section, int(correct)),
+        "INSERT INTO answers (user_id, section, correct, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, section, int(correct), datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
+
+
+def get_admin_stats() -> dict:
+    now = datetime.utcnow()
+    today_start = now.strftime("%Y-%m-%d")
+    week_ago = (now - timedelta(days=7)).isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    new_today = conn.execute("SELECT COUNT(*) FROM users WHERE first_seen >= ?", (today_start,)).fetchone()[0]
+    new_week = conn.execute("SELECT COUNT(*) FROM users WHERE first_seen >= ?", (week_ago,)).fetchone()[0]
+    active_today = conn.execute("SELECT COUNT(*) FROM users WHERE last_seen >= ?", (today_start,)).fetchone()[0]
+    active_week = conn.execute("SELECT COUNT(*) FROM users WHERE last_seen >= ?", (week_ago,)).fetchone()[0]
+    total_answers = conn.execute("SELECT COUNT(*) FROM answers").fetchone()[0]
+    answers_today = conn.execute(
+        "SELECT COUNT(*) FROM answers WHERE created_at >= ?", (today_start,)
+    ).fetchone()[0]
+    top_sections = conn.execute(
+        "SELECT section, COUNT(*) c FROM answers GROUP BY section ORDER BY c DESC LIMIT 5"
+    ).fetchall()
+    conn.close()
+
+    return {
+        "total_users": total_users,
+        "new_today": new_today,
+        "new_week": new_week,
+        "active_today": active_today,
+        "active_week": active_week,
+        "total_answers": total_answers,
+        "answers_today": answers_today,
+        "top_sections": top_sections,
+    }
 
 
 def get_stats(user_id: int) -> dict:
@@ -125,6 +186,7 @@ def result_tier(percentage: int) -> str:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    touch_user(message.from_user.id, message.from_user.full_name)
     await message.answer(
         "⚡️ <b>Physics Bot</b>\n"
         "Тренажёр формул по физике\n\n"
@@ -147,6 +209,7 @@ async def cmd_start(message: Message) -> None:
 @dp.message(Command("quiz"))
 @dp.message(F.text == QUIZ_BUTTON)
 async def cmd_quiz(message: Message) -> None:
+    touch_user(message.from_user.id, message.from_user.full_name)
     builder = InlineKeyboardBuilder()
     for key, section in SECTIONS.items():
         count = len(section["questions"])
@@ -305,6 +368,7 @@ async def check_answer(callback: CallbackQuery) -> None:
     is_correct = choice == q["correct"]
     session["answers"][index] = choice
     record_answer(user_id, session["section"], is_correct)
+    touch_user(user_id, callback.from_user.full_name)
 
     await callback.answer("Верно! ✅" if is_correct else "Неверно ❌")
     try:
@@ -380,6 +444,32 @@ async def cmd_stats(message: Message) -> None:
         f"Точность: <b>{accuracy}%</b>\n\n"
         f"{result_tier(accuracy)}\n\n"
         f"📚 <b>По разделам:</b>\n{breakdown}"
+    )
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    stats = get_admin_stats()
+    if stats["top_sections"]:
+        top_lines = [
+            f"{SECTIONS.get(key, {}).get('title', key)}: <b>{count}</b>"
+            for key, count in stats["top_sections"]
+        ]
+        top_text = "\n".join(top_lines)
+    else:
+        top_text = "пока нет данных"
+
+    await message.answer(
+        "🛠 <b>Админ-статистика</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total_users']}</b>\n"
+        f"🆕 Новых сегодня: <b>{stats['new_today']}</b> · за неделю: <b>{stats['new_week']}</b>\n"
+        f"🔥 Активных сегодня: <b>{stats['active_today']}</b> · за неделю: <b>{stats['active_week']}</b>\n\n"
+        f"📝 Всего ответов: <b>{stats['total_answers']}</b>\n"
+        f"📝 Ответов сегодня: <b>{stats['answers_today']}</b>\n\n"
+        f"🏆 <b>Топ разделов по числу ответов:</b>\n{top_text}"
     )
 
 
