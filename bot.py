@@ -20,7 +20,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from formula_render import render_formula
-from questions import SECTIONS
+from questions import TRACKS
 
 # Токен читается из переменной окружения BOT_TOKEN (так задаётся на хостинге).
 # Для удобного локального запуска, если переменной окружения нет, берётся
@@ -54,8 +54,36 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# user_id -> {"section": str, "answers": {question_index: chosen_option_index}, "order": [shuffled question indices]}
+# user_id -> {"track": str, "section": str, "answers": {question_index: chosen_option_index},
+#             "order": [shuffled question indices]}
 user_sessions: dict[int, dict] = {}
+
+
+def get_section(track_key: str, section_key: str) -> dict:
+    return TRACKS[track_key]["sections"][section_key]
+
+
+def get_session_section(session: dict) -> dict:
+    return get_section(session["track"], session["section"])
+
+
+def db_section_key(track_key: str, section_key: str) -> str:
+    return f"{track_key}:{section_key}"
+
+
+def section_title(db_key: str) -> str:
+    """Резолвит человекочитаемое название раздела по ключу из БД. Новые записи
+    хранятся как "track:section" (например "ege:mechanics"); записи, сделанные
+    до появления уровней ЕГЭ/ОГЭ, хранят просто "section" — такие считаем ЕГЭ."""
+    if ":" in db_key:
+        track_key, section_key = db_key.split(":", 1)
+        track = TRACKS.get(track_key)
+        section = track["sections"].get(section_key) if track else None
+        if track and section:
+            return f"{track['title']} · {section['title']}"
+        return db_key
+    section = TRACKS["ege"]["sections"].get(db_key)
+    return section["title"] if section else db_key
 
 
 def init_db() -> None:
@@ -211,26 +239,57 @@ async def cmd_start(message: Message) -> None:
 async def cmd_quiz(message: Message) -> None:
     touch_user(message.from_user.id, message.from_user.full_name)
     builder = InlineKeyboardBuilder()
-    for key, section in SECTIONS.items():
-        count = len(section["questions"])
-        builder.button(text=f"{section['title']} · {count} вопросов", callback_data=f"section:{key}")
+    for key, track in TRACKS.items():
+        builder.button(text=track["title"], callback_data=f"track:{key}")
     builder.adjust(1)
-    await message.answer("📚 <b>Выберите раздел:</b>", reply_markup=builder.as_markup())
+    await message.answer("🎯 <b>Выберите уровень подготовки:</b>", reply_markup=builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("track:"))
+async def choose_track(callback: CallbackQuery) -> None:
+    track_key = callback.data.split(":", 1)[1]
+    track = TRACKS[track_key]
+    sections = track["sections"]
+    await callback.answer()
+
+    if not sections:
+        await callback.message.answer(
+            f"🚧 Раздел «{track['title']}» пока в разработке — вопросы скоро здесь появятся.\n"
+            f"А пока загляни в 🎓 ЕГЭ — там уже много вопросов по всем темам!"
+        )
+        return
+
+    builder = InlineKeyboardBuilder()
+    for key, section in sections.items():
+        count = len(section["questions"])
+        builder.button(
+            text=f"{section['title']} · {count} вопросов",
+            callback_data=f"section:{track_key}:{key}",
+        )
+    builder.adjust(1)
+    await callback.message.answer(
+        f"📚 <b>{track['title']} · выберите раздел:</b>", reply_markup=builder.as_markup()
+    )
 
 
 @dp.callback_query(F.data.startswith("section:"))
 async def choose_section(callback: CallbackQuery) -> None:
-    section_key = callback.data.split(":", 1)[1]
-    order = list(range(len(SECTIONS[section_key]["questions"])))
+    _, track_key, section_key = callback.data.split(":", 2)
+    order = list(range(len(get_section(track_key, section_key)["questions"])))
     random.shuffle(order)
-    user_sessions[callback.from_user.id] = {"section": section_key, "answers": {}, "order": order}
+    user_sessions[callback.from_user.id] = {
+        "track": track_key,
+        "section": section_key,
+        "answers": {},
+        "order": order,
+    }
     await callback.answer()
     await show_map(callback.from_user.id, callback.message)
 
 
 async def show_map(user_id: int, message: Message) -> None:
     session = user_sessions[user_id]
-    section = SECTIONS[session["section"]]
+    section = get_session_section(session)
     questions = section["questions"]
     answers = session["answers"]
     order = session["order"]
@@ -276,7 +335,7 @@ async def send_question_message(message: Message, q: dict, text: str, markup) ->
 
 async def show_question(user_id: int, message: Message, index: int) -> None:
     session = user_sessions[user_id]
-    section = SECTIONS[session["section"]]
+    section = get_session_section(session)
     questions = section["questions"]
     order = session["order"]
     total = len(questions)
@@ -364,10 +423,10 @@ async def check_answer(callback: CallbackQuery) -> None:
         await callback.answer("Вы уже отвечали на этот вопрос")
         return
 
-    q = SECTIONS[session["section"]]["questions"][index]
+    q = get_session_section(session)["questions"][index]
     is_correct = choice == q["correct"]
     session["answers"][index] = choice
-    record_answer(user_id, session["section"], is_correct)
+    record_answer(user_id, db_section_key(session["track"], session["section"]), is_correct)
     touch_user(user_id, callback.from_user.full_name)
 
     await callback.answer("Верно! ✅" if is_correct else "Неверно ❌")
@@ -387,7 +446,7 @@ async def finish_quiz(callback: CallbackQuery) -> None:
         return
     await callback.answer()
 
-    section = SECTIONS[session["section"]]
+    section = get_session_section(session)
     questions = section["questions"]
     total = len(questions)
     answers = session["answers"]
@@ -427,14 +486,21 @@ async def cmd_stats(message: Message) -> None:
     section_stats = get_section_stats(message.from_user.id)
 
     lines = []
-    for key, section in SECTIONS.items():
-        s = section_stats.get(key)
-        if s and s["total"] > 0:
-            pct = round(s["correct"] / s["total"] * 100)
-            lines.append(f"{section['title']}: <b>{s['correct']}/{s['total']}</b> ({pct}%)")
-        else:
-            lines.append(f"{section['title']}: <i>нет данных</i>")
-    breakdown = "\n".join(lines)
+    for track_key, track in TRACKS.items():
+        sections = track["sections"]
+        if not sections:
+            continue
+        lines.append(f"\n<b>{track['title']}</b>")
+        for key, section in sections.items():
+            s = section_stats.get(db_section_key(track_key, key))
+            if not s and track_key == "ege":
+                s = section_stats.get(key)  # записи до появления уровней ЕГЭ/ОГЭ
+            if s and s["total"] > 0:
+                pct = round(s["correct"] / s["total"] * 100)
+                lines.append(f"{section['title']}: <b>{s['correct']}/{s['total']}</b> ({pct}%)")
+            else:
+                lines.append(f"{section['title']}: <i>нет данных</i>")
+    breakdown = "\n".join(lines).strip()
 
     await message.answer(
         "📊 <b>Твоя статистика</b>\n\n"
@@ -455,8 +521,7 @@ async def cmd_admin(message: Message) -> None:
     stats = get_admin_stats()
     if stats["top_sections"]:
         top_lines = [
-            f"{SECTIONS.get(key, {}).get('title', key)}: <b>{count}</b>"
-            for key, count in stats["top_sections"]
+            f"{section_title(key)}: <b>{count}</b>" for key, count in stats["top_sections"]
         ]
         top_text = "\n".join(top_lines)
     else:
