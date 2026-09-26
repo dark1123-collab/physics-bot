@@ -104,13 +104,23 @@ def init_db() -> None:
             user_id INTEGER PRIMARY KEY,
             full_name TEXT,
             first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL
+            last_seen TEXT NOT NULL,
+            current_streak INTEGER NOT NULL DEFAULT 0,
+            longest_streak INTEGER NOT NULL DEFAULT 0,
+            last_activity_date TEXT
         )
         """
     )
     existing_columns = [row[1] for row in conn.execute("PRAGMA table_info(answers)")]
     if "created_at" not in existing_columns:
         conn.execute("ALTER TABLE answers ADD COLUMN created_at TEXT")
+    existing_user_columns = [row[1] for row in conn.execute("PRAGMA table_info(users)")]
+    if "current_streak" not in existing_user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN current_streak INTEGER NOT NULL DEFAULT 0")
+    if "longest_streak" not in existing_user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN longest_streak INTEGER NOT NULL DEFAULT 0")
+    if "last_activity_date" not in existing_user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN last_activity_date TEXT")
     conn.commit()
     conn.close()
 
@@ -127,6 +137,81 @@ def touch_user(user_id: int, full_name: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def _days_word(n: int) -> str:
+    if 11 <= n % 100 <= 14:
+        return "дней"
+    last = n % 10
+    if last == 1:
+        return "день"
+    if 2 <= last <= 4:
+        return "дня"
+    return "дней"
+
+
+def update_streak(user_id: int) -> int:
+    """Обновляет серию пользователя при ответе на вопрос и возвращает текущую
+    длину серии. Серия растёт, если пользователь отвечал вчера, сохраняется,
+    если уже отвечал сегодня, и сбрасывается до 1 при любом другом раскладе."""
+    today = datetime.utcnow().date()
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT current_streak, longest_streak, last_activity_date FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    current_streak, longest_streak, last_date_str = row if row else (0, 0, None)
+    current_streak = current_streak or 0
+    longest_streak = longest_streak or 0
+    last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date() if last_date_str else None
+
+    if last_date == today:
+        pass
+    elif last_date == today - timedelta(days=1):
+        current_streak += 1
+    else:
+        current_streak = 1
+    longest_streak = max(longest_streak, current_streak)
+
+    conn.execute(
+        "UPDATE users SET current_streak = ?, longest_streak = ?, last_activity_date = ? WHERE user_id = ?",
+        (current_streak, longest_streak, today.isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+    return current_streak
+
+
+def get_streak(user_id: int) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT current_streak, longest_streak, last_activity_date FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"current": 0, "longest": 0}
+    current, longest, last_date_str = row
+    current = current or 0
+    longest = longest or 0
+    if last_date_str:
+        last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+        if last_date < datetime.utcnow().date() - timedelta(days=1):
+            current = 0  # серия прервалась, но ещё не сброшена в БД до следующего ответа
+    return {"current": current, "longest": longest}
+
+
+def get_streak_reminder_users() -> list[tuple[int, int]]:
+    """Пользователи, у которых серия жива, но сегодня они ещё не отвечали —
+    им и напоминаем не терять серию."""
+    yesterday = (datetime.utcnow().date() - timedelta(days=1)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT user_id, current_streak FROM users WHERE last_activity_date = ?",
+        (yesterday,),
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def record_answer(user_id: int, section: str, correct: bool) -> None:
@@ -428,6 +513,7 @@ async def check_answer(callback: CallbackQuery) -> None:
     session["answers"][index] = choice
     record_answer(user_id, db_section_key(session["track"], session["section"]), is_correct)
     touch_user(user_id, callback.from_user.full_name)
+    update_streak(user_id)
 
     await callback.answer("Верно! ✅" if is_correct else "Неверно ❌")
     try:
@@ -484,6 +570,10 @@ async def cmd_stats(message: Message) -> None:
 
     accuracy = round(stats["correct"] / stats["total"] * 100)
     section_stats = get_section_stats(message.from_user.id)
+    streak = get_streak(message.from_user.id)
+    streak_line = f"🔥 Серия: <b>{streak['current']} {_days_word(streak['current'])}</b> подряд"
+    if streak["longest"] > streak["current"]:
+        streak_line += f" (рекорд: {streak['longest']})"
 
     lines = []
     for track_key, track in TRACKS.items():
@@ -507,7 +597,8 @@ async def cmd_stats(message: Message) -> None:
         f"{progress_bar(stats['correct'], stats['total'])}\n"
         f"Отвечено вопросов: <b>{stats['total']}</b>\n"
         f"Правильно: <b>{stats['correct']}</b>\n"
-        f"Точность: <b>{accuracy}%</b>\n\n"
+        f"Точность: <b>{accuracy}%</b>\n"
+        f"{streak_line}\n\n"
         f"{result_tier(accuracy)}\n\n"
         f"📚 <b>По разделам:</b>\n{breakdown}"
     )
@@ -538,8 +629,32 @@ async def cmd_admin(message: Message) -> None:
     )
 
 
+async def streak_reminder_loop() -> None:
+    """Раз в сутки в 16:00 UTC (19:00 МСК) напоминает пользователям, у которых
+    есть серия, но которые ещё не отвечали сегодня, не терять её."""
+    while True:
+        now = datetime.utcnow()
+        target = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+
+        for user_id, streak in get_streak_reminder_users():
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"🔥 Не теряй серию из {streak} {_days_word(streak)} подряд — "
+                    f"реши хотя бы один вопрос сегодня, иначе она обнулится!\n\n"
+                    f"Жми 🧮 Квиз 👇",
+                    reply_markup=MAIN_KEYBOARD,
+                )
+            except Exception:
+                logging.exception("Не удалось отправить напоминание пользователю %s", user_id)
+
+
 async def main() -> None:
     init_db()
+    asyncio.create_task(streak_reminder_loop())
     await dp.start_polling(bot)
 
 
