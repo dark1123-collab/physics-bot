@@ -107,7 +107,8 @@ def init_db() -> None:
             last_seen TEXT NOT NULL,
             current_streak INTEGER NOT NULL DEFAULT 0,
             longest_streak INTEGER NOT NULL DEFAULT 0,
-            last_activity_date TEXT
+            last_activity_date TEXT,
+            last_reminder_sent TEXT
         )
         """
     )
@@ -121,6 +122,8 @@ def init_db() -> None:
         conn.execute("ALTER TABLE users ADD COLUMN longest_streak INTEGER NOT NULL DEFAULT 0")
     if "last_activity_date" not in existing_user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN last_activity_date TEXT")
+    if "last_reminder_sent" not in existing_user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN last_reminder_sent TEXT")
     conn.commit()
     conn.close()
 
@@ -199,6 +202,50 @@ def get_streak(user_id: int) -> dict:
         if last_date < datetime.utcnow().date() - timedelta(days=1):
             current = 0  # серия прервалась, но ещё не сброшена в БД до следующего ответа
     return {"current": current, "longest": longest}
+
+
+INACTIVITY_THRESHOLD_DAYS = 3
+INACTIVITY_REPEAT_DAYS = 7
+
+MOTIVATIONAL_MESSAGES = [
+    "Привет! 👋 Соскучились по формулам? Загляни на пару вопросов — займёт 5 минут, а прогресс не остановится.",
+    "🎯 Экзамен не ждёт, а вот пара вопросов по физике точно не займёт много времени. Возвращайся, когда будет момент!",
+    "🔥 Даже 3 вопроса в день — это уже привычка, которая сработает на экзамене. Не теряй темп!",
+    "📚 Физика не забывается сама — но и не выучивается без повторения. Загляни в квиз, когда будет минутка.",
+    "💪 Маленькие шаги каждый день дают большой результат на ЕГЭ. Формулы ждут!",
+    "⏰ Давно не заходил — как насчёт освежить пару тем прямо сейчас?",
+    "🚀 Каждый решённый вопрос — на шаг ближе к высокому баллу. Не откладывай надолго!",
+]
+
+
+def get_inactive_users() -> list[int]:
+    """Пользователи, которые не заходили INACTIVITY_THRESHOLD_DAYS дней и которым
+    не отправляли напоминание последние INACTIVITY_REPEAT_DAYS дней (чтобы не
+    надоедать тем, кто уже давно ушёл и не отвечает)."""
+    now = datetime.utcnow()
+    inactive_before = (now - timedelta(days=INACTIVITY_THRESHOLD_DAYS)).isoformat()
+    repeat_before = (now - timedelta(days=INACTIVITY_REPEAT_DAYS)).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        """
+        SELECT user_id FROM users
+        WHERE last_seen < ?
+        AND (last_reminder_sent IS NULL OR last_reminder_sent < ?)
+        """,
+        (inactive_before, repeat_before),
+    ).fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def mark_reminder_sent(user_id: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE users SET last_reminder_sent = ? WHERE user_id = ?",
+        (datetime.utcnow().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_streak_reminder_users() -> list[tuple[int, int]]:
@@ -629,9 +676,11 @@ async def cmd_admin(message: Message) -> None:
     )
 
 
-async def streak_reminder_loop() -> None:
-    """Раз в сутки в 16:00 UTC (19:00 МСК) напоминает пользователям, у которых
-    есть серия, но которые ещё не отвечали сегодня, не терять её."""
+async def daily_reminder_loop() -> None:
+    """Раз в сутки в 16:00 UTC (19:00 МСК):
+    1) напоминает пользователям с живой серией, которые ещё не отвечали сегодня, не терять её;
+    2) ненавязчиво напоминает о боте тем, кто не заходил INACTIVITY_THRESHOLD_DAYS+ дней,
+       не чаще раза в INACTIVITY_REPEAT_DAYS дней, случайным мотивационным сообщением."""
     while True:
         now = datetime.utcnow()
         target = now.replace(hour=16, minute=0, second=0, microsecond=0)
@@ -651,10 +700,21 @@ async def streak_reminder_loop() -> None:
             except Exception:
                 logging.exception("Не удалось отправить напоминание пользователю %s", user_id)
 
+        for user_id in get_inactive_users():
+            try:
+                await bot.send_message(
+                    user_id,
+                    random.choice(MOTIVATIONAL_MESSAGES),
+                    reply_markup=MAIN_KEYBOARD,
+                )
+                mark_reminder_sent(user_id)
+            except Exception:
+                logging.exception("Не удалось отправить напоминание неактивному пользователю %s", user_id)
+
 
 async def main() -> None:
     init_db()
-    asyncio.create_task(streak_reminder_loop())
+    asyncio.create_task(daily_reminder_loop())
     await dp.start_polling(bot)
 
 
