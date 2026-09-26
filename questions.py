@@ -1773,15 +1773,17 @@ def _build_aggregates(sections: dict) -> None:
 
 _build_aggregates(EGE_SECTIONS)
 
-# Раздел «ОГЭ и 7-9 класс» пока пуст — наполним темами позже, так же, как ЕГЭ.
-# Как только в OGE_SECTIONS появятся первые тематические разделы (ключи вида
-# "mechanics": {"title": ..., "questions": [...]}), добавьте в конце строку
-# _build_aggregates(OGE_SECTIONS), чтобы получить свои марафон и тренажёр формул.
+# Разделы «ОГЭ» и «7-9 класс» пока пусты — наполним темами позже, так же, как ЕГЭ.
+# Как только в OGE_SECTIONS / GRADES_7_9_SECTIONS появятся первые тематические
+# разделы (ключи вида "mechanics": {"title": ..., "questions": [...]}), добавьте
+# в конце строку _build_aggregates(...), чтобы получить свои марафон и тренажёр формул.
 OGE_SECTIONS: dict = {}
+GRADES_7_9_SECTIONS: dict = {}
 
 # TRACKS — верхний уровень выбора в боте: сначала пользователь выбирает уровень
-# подготовки (ЕГЭ / ОГЭ и 7-9 класс), затем — обычный раздел внутри него.
+# подготовки (ЕГЭ / ОГЭ / 7-9 класс), затем — обычный раздел внутри него.
 TRACKS = {
     "ege": {"title": "🎓 ЕГЭ", "sections": EGE_SECTIONS},
-    "oge": {"title": "📘 ОГЭ и 7-9 класс", "sections": OGE_SECTIONS},
+    "oge": {"title": "📘 ОГЭ", "sections": OGE_SECTIONS},
+    "grades_7_9": {"title": "📗 7-9 класс", "sections": GRADES_7_9_SECTIONS},
 }
