@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -457,10 +458,20 @@ def nav_buttons(index: int, order: list[int]) -> list[InlineKeyboardButton]:
     return buttons
 
 
+CAPTION_LIMIT = 1024
+
+
+def visible_length(html_text: str) -> int:
+    return len(re.sub(r"<[^>]+>", "", html_text))
+
+
 async def send_question_message(message: Message, q: dict, text: str, markup) -> None:
     image_path = q.get("image")
-    if image_path:
+    if image_path and visible_length(text) <= CAPTION_LIMIT:
         await message.answer_photo(photo=FSInputFile(image_path), caption=text, reply_markup=markup)
+    elif image_path:
+        await message.answer_photo(photo=FSInputFile(image_path))
+        await message.answer(text, reply_markup=markup)
     else:
         await message.answer(text, reply_markup=markup)
 
