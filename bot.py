@@ -12,11 +12,14 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     KeyboardButton,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -43,6 +46,9 @@ DB_PATH = "stats.db"
 OPTION_LETTERS = ["А", "Б", "В", "Г", "Д", "Е"]
 CHANNEL_URL = "https://t.me/nicholas_physics"
 ADMIN_ID = 881618387
+
+DONATE_BUTTON = "⭐ Поддержать бота"
+DONATE_AMOUNTS = [15, 50, 100, 250]  # варианты суммы в Telegram Stars
 
 QUIZ_BUTTON = "🧮 Квиз"
 STATS_BUTTON = "📊 Статистика"
@@ -126,8 +132,51 @@ def init_db() -> None:
         conn.execute("ALTER TABLE users ADD COLUMN last_activity_date TEXT")
     if "last_reminder_sent" not in existing_user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN last_reminder_sent TEXT")
+    # Донаты звёздами. charge_id нужен для возврата (refundStarPayment).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS donations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            full_name TEXT,
+            stars INTEGER NOT NULL,
+            charge_id TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            refunded INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     conn.close()
+
+
+def record_donation(user_id: int, full_name: str, stars: int, charge_id: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO donations (user_id, full_name, stars, charge_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, full_name, stars, charge_id, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_donation_refunded(charge_id: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE donations SET refunded = 1 WHERE charge_id = ?", (charge_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_donation_stats() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    count, stars = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM donations WHERE refunded = 0"
+    ).fetchone()
+    last = conn.execute(
+        "SELECT full_name, stars, created_at FROM donations WHERE refunded = 0 ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+    conn.close()
+    return {"count": count, "stars": stars, "last": last}
 
 
 def touch_user(user_id: int, full_name: str) -> None:
@@ -685,6 +734,7 @@ async def finish_quiz(callback: CallbackQuery) -> None:
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 К списку вопросов", callback_data="map")
     builder.row(InlineKeyboardButton(text="📢 Канал с разборами и мотивацией", url=CHANNEL_URL))
+    builder.row(InlineKeyboardButton(text=DONATE_BUTTON, callback_data="donate"))
 
     await callback.message.answer(
         f"🏁 <b>Итог по разделу «{section['title']}»</b>\n\n"
@@ -732,8 +782,127 @@ async def cmd_stats(message: Message) -> None:
         f"Точность: <b>{accuracy}%</b>\n"
         f"{streak_line}\n\n"
         f"{result_tier(accuracy)}\n\n"
-        f"📚 <b>По разделам:</b>\n{breakdown}"
+        f"📚 <b>По разделам:</b>\n{breakdown}",
+        reply_markup=InlineKeyboardBuilder().button(text=DONATE_BUTTON, callback_data="donate").as_markup(),
     )
+
+
+# ───────────── Поддержка бота звёздами (Telegram Stars) ─────────────
+# Валюта XTR, provider_token не нужен. Telegram требует у платных ботов /paysupport и /terms.
+
+DONATE_TEXT = (
+    "⭐ <b>Поддержать бота</b>\n\n"
+    "Бот бесплатный, но сервер и пополнение базы задач стоят денег и времени. "
+    "Если бот помогает готовиться — можно поддержать его звёздами Telegram. "
+    "Это добровольно и ничего не меняет в доступе: все задачи остаются открытыми.\n\n"
+    "Выбери сумму 👇"
+)
+
+
+def donate_markup():
+    builder = InlineKeyboardBuilder()
+    for amount in DONATE_AMOUNTS:
+        builder.button(text=f"⭐ {amount}", callback_data=f"donate:{amount}")
+    builder.adjust(len(DONATE_AMOUNTS))
+    return builder.as_markup()
+
+
+@dp.message(Command("donate"))
+async def cmd_donate(message: Message) -> None:
+    await message.answer(DONATE_TEXT, reply_markup=donate_markup())
+
+
+@dp.callback_query(F.data == "donate")
+async def choose_donation(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await callback.message.answer(DONATE_TEXT, reply_markup=donate_markup())
+
+
+@dp.callback_query(F.data.startswith("donate:"))
+async def send_donation_invoice(callback: CallbackQuery) -> None:
+    amount = int(callback.data.split(":", 1)[1])
+    if amount not in DONATE_AMOUNTS:
+        await callback.answer()
+        return
+    await callback.answer()
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title="Поддержка Physics Bot",
+        description=f"Добровольная поддержка бота: {amount} ⭐. Спасибо, что помогаешь проекту!",
+        payload=f"donate:{amount}",
+        currency="XTR",
+        prices=[LabeledPrice(label="Поддержка бота", amount=amount)],
+    )
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(query: PreCheckoutQuery) -> None:
+    # Подтверждаем только наши счета на поддержку; Telegram ждёт ответ не дольше 10 секунд.
+    ok = query.currency == "XTR" and query.invoice_payload.startswith("donate:")
+    await query.answer(ok=ok, error_message=None if ok else "Платёж не распознан, попробуй ещё раз.")
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: Message) -> None:
+    payment = message.successful_payment
+    record_donation(
+        message.from_user.id,
+        message.from_user.full_name,
+        payment.total_amount,
+        payment.telegram_payment_charge_id,
+    )
+    await message.answer(
+        f"💛 Спасибо за поддержку — {payment.total_amount} ⭐!\n"
+        "Это правда помогает держать бота на плаву и добавлять новые задачи. Удачной подготовки!",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"⭐ Донат: <b>{payment.total_amount}</b> от {message.from_user.full_name} "
+            f"(id {message.from_user.id})\ncharge_id: <code>{payment.telegram_payment_charge_id}</code>",
+        )
+    except Exception:
+        logging.exception("Не удалось уведомить админа о донате")
+
+
+@dp.message(Command("paysupport"))
+async def cmd_paysupport(message: Message) -> None:
+    await message.answer(
+        "💬 <b>Вопросы по оплате</b>\n\n"
+        "Если с поддержкой звёздами что-то пошло не так или ты хочешь вернуть платёж — "
+        "напиши автору бота через канал @nicholas_physics, указав дату и сумму. "
+        "Ответим и при необходимости вернём звёзды."
+    )
+
+
+@dp.message(Command("terms"))
+async def cmd_terms(message: Message) -> None:
+    await message.answer(
+        "📄 <b>Условия</b>\n\n"
+        "Physics Bot — бесплатный тренажёр по физике. Оплата звёздами — добровольная поддержка проекта, "
+        "она не открывает дополнительного доступа и не является покупкой товара или услуги. "
+        "Возврат возможен по запросу через /paysupport."
+    )
+
+
+@dp.message(Command("refund"))
+async def cmd_refund(message: Message) -> None:
+    """Только для админа: /refund <user_id> <charge_id> — вернуть звёзды."""
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].isdigit():
+        await message.answer("Формат: /refund <user_id> <charge_id> (оба есть в уведомлении о донате)")
+        return
+    user_id, charge_id = int(parts[1]), parts[2]
+    try:
+        await bot.refund_star_payment(user_id=user_id, telegram_payment_charge_id=charge_id)
+    except TelegramBadRequest as e:
+        await message.answer(f"Не получилось вернуть: {e.message}")
+        return
+    mark_donation_refunded(charge_id)
+    await message.answer("✅ Звёзды возвращены.")
 
 
 @dp.message(Command("admin"))
@@ -742,6 +911,7 @@ async def cmd_admin(message: Message) -> None:
         return
 
     stats = get_admin_stats()
+    donations = get_donation_stats()
     if stats["top_sections"]:
         top_lines = [
             f"{section_title(key)}: <b>{count}</b>" for key, count in stats["top_sections"]
@@ -757,7 +927,9 @@ async def cmd_admin(message: Message) -> None:
         f"🔥 Активных сегодня: <b>{stats['active_today']}</b> · за неделю: <b>{stats['active_week']}</b>\n\n"
         f"📝 Всего ответов: <b>{stats['total_answers']}</b>\n"
         f"📝 Ответов сегодня: <b>{stats['answers_today']}</b>\n\n"
-        f"🏆 <b>Топ разделов по числу ответов:</b>\n{top_text}"
+        f"🏆 <b>Топ разделов по числу ответов:</b>\n{top_text}\n\n"
+        f"⭐ <b>Поддержка:</b> {donations['count']} платежей, всего <b>{donations['stars']}</b> звёзд"
+        + "".join(f"\n· {name}: {stars} ⭐ ({created[:10]})" for name, stars, created in donations["last"])
     )
 
 
@@ -799,6 +971,13 @@ async def daily_reminder_loop() -> None:
 
 async def main() -> None:
     init_db()
+    await bot.set_my_commands([
+        BotCommand(command="quiz", description="🧮 Квиз"),
+        BotCommand(command="stats", description="📊 Статистика"),
+        BotCommand(command="donate", description="⭐ Поддержать бота"),
+        BotCommand(command="paysupport", description="Вопросы по оплате"),
+        BotCommand(command="terms", description="Условия"),
+    ])
     asyncio.create_task(daily_reminder_loop())
     await dp.start_polling(bot)
 
