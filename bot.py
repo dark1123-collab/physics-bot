@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -21,7 +22,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from formula_render import render_formula
-from questions import TRACKS
+from questions import LEGACY_SECTION_TITLES, TRACKS
 
 # Токен читается из переменной окружения BOT_TOKEN (так задаётся на хостинге).
 # Для удобного локального запуска, если переменной окружения нет, берётся
@@ -82,9 +83,9 @@ def section_title(db_key: str) -> str:
         section = track["sections"].get(section_key) if track else None
         if track and section:
             return f"{track['title']} · {section['title']}"
-        return db_key
-    section = TRACKS["ege"]["sections"].get(db_key)
-    return section["title"] if section else db_key
+    # Разделы до перехода на номера заданий (ege:mechanics и т.п.) и совсем старые
+    # записи без префикса — названия из LEGACY_SECTION_TITLES.
+    return LEGACY_SECTION_TITLES.get(db_key, db_key)
 
 
 def init_db() -> None:
@@ -367,15 +368,37 @@ async def cmd_start(message: Message) -> None:
     )
 
 
-@dp.message(Command("quiz"))
-@dp.message(F.text == QUIZ_BUTTON)
-async def cmd_quiz(message: Message) -> None:
-    touch_user(message.from_user.id, message.from_user.full_name)
+TRACKS_TEXT = "🎯 <b>Выберите уровень подготовки:</b>"
+
+
+def tracks_markup():
     builder = InlineKeyboardBuilder()
     for key, track in TRACKS.items():
         builder.button(text=track["title"], callback_data=f"track:{key}")
     builder.adjust(1)
-    await message.answer("🎯 <b>Выберите уровень подготовки:</b>", reply_markup=builder.as_markup())
+    return builder.as_markup()
+
+
+async def show_menu(callback: CallbackQuery, text: str, markup) -> None:
+    """Навигация по меню квиза меняет одно и то же сообщение, а не шлёт новые.
+    Если отредактировать нельзя (старое сообщение, картинка) — отправляем новое."""
+    try:
+        await callback.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=markup)
+
+
+@dp.message(Command("quiz"))
+@dp.message(F.text == QUIZ_BUTTON)
+async def cmd_quiz(message: Message) -> None:
+    touch_user(message.from_user.id, message.from_user.full_name)
+    await message.answer(TRACKS_TEXT, reply_markup=tracks_markup())
+
+
+@dp.callback_query(F.data == "tracks")
+async def back_to_tracks(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await show_menu(callback, TRACKS_TEXT, tracks_markup())
 
 
 @dp.callback_query(F.data.startswith("track:"))
@@ -393,16 +416,74 @@ async def choose_track(callback: CallbackQuery) -> None:
         return
 
     builder = InlineKeyboardBuilder()
-    for key, section in sections.items():
+    menu = track.get("menu")
+    if menu:
+        # ЕГЭ/ОГЭ: сначала группы (Часть 1, Часть 2, Теория), потом марафон и формулы.
+        for group in menu:
+            count = sum(
+                len(s["questions"]) for s in sections.values() if s.get("group") == group["key"]
+            )
+            builder.button(
+                text=f"{group['title']} · {count}", callback_data=f"group:{track_key}:{group['key']}"
+            )
+        top_level = {k: s for k, s in sections.items() if "group" not in s}
+    else:
+        top_level = sections
+    for key, section in top_level.items():
         count = len(section["questions"])
         builder.button(
             text=f"{section['title']} · {count} вопросов",
             callback_data=f"section:{track_key}:{key}",
         )
     builder.adjust(1)
-    await callback.message.answer(
-        f"📚 <b>{track['title']} · выберите раздел:</b>", reply_markup=builder.as_markup()
-    )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="tracks"))
+    await show_menu(callback, f"📚 <b>{track['title']} · выберите раздел:</b>", builder.as_markup())
+
+
+@dp.callback_query(F.data.startswith("group:"))
+async def choose_group(callback: CallbackQuery) -> None:
+    _, track_key, group_key = callback.data.split(":", 2)
+    track = TRACKS[track_key]
+    group = next(g for g in track["menu"] if g["key"] == group_key)
+    await callback.answer()
+
+    group_sections = [(k, s) for k, s in track["sections"].items() if s.get("group") == group_key]
+    builder = InlineKeyboardBuilder()
+
+    if group_key == "theory":
+        # Темы теории — по одной в строке, названия короткие и целиком помещаются.
+        for key, section in group_sections:
+            builder.button(
+                text=f"{section['title']} · {len(section['questions'])}",
+                callback_data=f"section:{track_key}:{key}",
+            )
+        builder.adjust(1)
+        text = f"📚 <b>{track['title']} · {group['title']}</b>\n\nВыберите тему:"
+    else:
+        # Номера заданий: полные названия — списком в тексте, кнопки — компактная
+        # сетка из одних номеров (в кнопке помещается ~10 символов, названия обрезались).
+        lines = []
+        for key, section in group_sections:
+            count = len(section["questions"])
+            if count:
+                lines.append(f"{section['title']} — <b>{count}</b>")
+                builder.button(text=section["button"], callback_data=f"section:{track_key}:{key}")
+            else:
+                lines.append(f"<i>{section['title']} — скоро</i>")
+                builder.button(text=f"{section['button']} ⏳", callback_data="soon")
+        builder.adjust(4 if len(group_sections) > 8 else 3)
+        text = (
+            f"📚 <b>{track['title']} · {group['title']}</b>\n\n"
+            + "\n".join(lines)
+            + "\n\n👇 Выберите номер задания (⏳ — задачи скоро появятся):"
+        )
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"track:{track_key}"))
+    await show_menu(callback, text, builder.as_markup())
+
+
+@dp.callback_query(F.data == "soon")
+async def soon_section(callback: CallbackQuery) -> None:
+    await callback.answer("🚧 Задачи по этому номеру скоро появятся!", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("section:"))
@@ -633,22 +714,15 @@ async def cmd_stats(message: Message) -> None:
     if streak["longest"] > streak["current"]:
         streak_line += f" (рекорд: {streak['longest']})"
 
+    # Показываем только разделы, где есть ответы: номеров заданий стало много,
+    # список «нет данных» по каждому был бы бесполезно длинным. Старые разделы
+    # (до перехода на номера) тоже попадают сюда со своими названиями.
     lines = []
-    for track_key, track in TRACKS.items():
-        sections = track["sections"]
-        if not sections:
-            continue
-        lines.append(f"\n<b>{track['title']}</b>")
-        for key, section in sections.items():
-            s = section_stats.get(db_section_key(track_key, key))
-            if not s and track_key == "ege":
-                s = section_stats.get(key)  # записи до появления уровней ЕГЭ/ОГЭ
-            if s and s["total"] > 0:
-                pct = round(s["correct"] / s["total"] * 100)
-                lines.append(f"{section['title']}: <b>{s['correct']}/{s['total']}</b> ({pct}%)")
-            else:
-                lines.append(f"{section['title']}: <i>нет данных</i>")
-    breakdown = "\n".join(lines).strip()
+    for db_key, s in sorted(section_stats.items(), key=lambda kv: section_title(kv[0])):
+        if s["total"] > 0:
+            pct = round(s["correct"] / s["total"] * 100)
+            lines.append(f"{section_title(db_key)}: <b>{s['correct']}/{s['total']}</b> ({pct}%)")
+    breakdown = "\n".join(lines)
 
     await message.answer(
         "📊 <b>Твоя статистика</b>\n\n"
