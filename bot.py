@@ -53,7 +53,10 @@ DONATE_AMOUNTS = [10, 25, 50, 100, 250, 500]  # варианты суммы в T
 QUIZ_BUTTON = "🧮 Квиз"
 STATS_BUTTON = "📊 Статистика"
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=QUIZ_BUTTON), KeyboardButton(text=STATS_BUTTON)]],
+    keyboard=[
+        [KeyboardButton(text=QUIZ_BUTTON), KeyboardButton(text=STATS_BUTTON)],
+        [KeyboardButton(text=DONATE_BUTTON)],
+    ],
     resize_keyboard=True,
 )
 
@@ -813,6 +816,7 @@ def donate_markup():
 
 
 @dp.message(Command("donate"))
+@dp.message(F.text == DONATE_BUTTON)
 async def cmd_donate(message: Message) -> None:
     await message.answer(DONATE_TEXT, reply_markup=donate_markup())
 
