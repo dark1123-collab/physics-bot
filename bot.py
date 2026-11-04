@@ -48,7 +48,7 @@ CHANNEL_URL = "https://t.me/nicholas_physics"
 ADMIN_ID = 881618387
 
 DONATE_BUTTON = "⭐ Поддержать бота"
-DONATE_AMOUNTS = [15, 50, 100, 250]  # варианты суммы в Telegram Stars
+DONATE_AMOUNTS = [10, 25, 50, 100, 250, 500]  # варианты суммы в Telegram Stars
 
 QUIZ_BUTTON = "🧮 Квиз"
 STATS_BUTTON = "📊 Статистика"
@@ -538,7 +538,12 @@ async def soon_section(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("section:"))
 async def choose_section(callback: CallbackQuery) -> None:
     _, track_key, section_key = callback.data.split(":", 2)
-    order = list(range(len(get_section(track_key, section_key)["questions"])))
+    section = TRACKS.get(track_key, {}).get("sections", {}).get(section_key)
+    if not section or not section["questions"]:
+        # Кнопка из старого сообщения: после перехода на номера заданий таких разделов нет.
+        await callback.answer("Разделы обновились — открой меню заново: «🧮 Квиз»", show_alert=True)
+        return
+    order = list(range(len(section["questions"])))
     random.shuffle(order)
     user_sessions[callback.from_user.id] = {
         "track": track_key,
@@ -803,7 +808,7 @@ def donate_markup():
     builder = InlineKeyboardBuilder()
     for amount in DONATE_AMOUNTS:
         builder.button(text=f"⭐ {amount}", callback_data=f"donate:{amount}")
-    builder.adjust(len(DONATE_AMOUNTS))
+    builder.adjust(3)
     return builder.as_markup()
 
 
