@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -66,7 +67,8 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher()
 
 # user_id -> {"track": str, "section": str, "answers": {question_index: chosen_option_index},
-#             "order": [shuffled question indices]}
+#             "order": [shuffled question indices],
+#             "sid": метка сессии — пишется в callback кнопок вопросов}
 user_sessions: dict[int, dict] = {}
 
 
@@ -553,6 +555,7 @@ async def choose_section(callback: CallbackQuery) -> None:
         "section": section_key,
         "answers": {},
         "order": order,
+        "sid": secrets.token_hex(3),
     }
     await callback.answer()
     await show_map(callback.from_user.id, callback.message)
@@ -572,7 +575,7 @@ async def show_map(user_id: int, message: Message) -> None:
             label = f"{'✅' if is_correct else '❌'}{position + 1}"
         else:
             label = str(position + 1)
-        builder.button(text=label, callback_data=f"q:{i}")
+        builder.button(text=label, callback_data=f"q:{session['sid']}:{i}")
     builder.adjust(5)
     builder.row(InlineKeyboardButton(text="🏁 Завершить и посмотреть итог", callback_data="finish"))
 
@@ -585,15 +588,34 @@ async def show_map(user_id: int, message: Message) -> None:
     await message.answer(text, reply_markup=builder.as_markup())
 
 
-def nav_buttons(index: int, order: list[int]) -> list[InlineKeyboardButton]:
+def nav_buttons(index: int, session: dict) -> list[InlineKeyboardButton]:
+    order = session["order"]
+    sid = session["sid"]
     position = order.index(index)
     buttons = []
     if position > 0:
-        buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"q:{order[position - 1]}"))
+        buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"q:{sid}:{order[position - 1]}"))
     buttons.append(InlineKeyboardButton(text="📋 Список", callback_data="map"))
     if position < len(order) - 1:
-        buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"q:{order[position + 1]}"))
+        buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"q:{sid}:{order[position + 1]}"))
     return buttons
+
+
+STALE_BUTTON_TEXT = "Это кнопка из прошлого теста. Открой вопрос из текущего списка: «📋 Список»"
+
+
+def parse_session_callback(callback: CallbackQuery) -> tuple[dict, list[int]] | None:
+    """Разбирает callback вида "q:<sid>:<i>" / "ans:<sid>:<i>:<c>". Кнопки содержат
+    метку сессии, чтобы нажатие в старом сообщении (из другого раздела или прошлого
+    прохода) не открывало и не засчитывало чужой вопрос текущего теста."""
+    session = user_sessions.get(callback.from_user.id)
+    parts = callback.data.split(":")[1:]
+    if not session or len(parts) < 2 or parts[0] != session["sid"]:
+        return None
+    try:
+        return session, [int(p) for p in parts[1:]]
+    except ValueError:
+        return None
 
 
 CAPTION_LIMIT = 1024
@@ -642,7 +664,7 @@ async def show_question(user_id: int, message: Message, index: int) -> None:
         if source:
             text += f"\n\n📚 <i>Источник: {source}</i>"
         builder = InlineKeyboardBuilder()
-        builder.row(*nav_buttons(index, order))
+        builder.row(*nav_buttons(index, session))
         markup = builder.as_markup()
 
         # После ответа могут прийти ещё картинки: формула и решение (например, фото
@@ -666,9 +688,10 @@ async def show_question(user_id: int, message: Message, index: int) -> None:
     else:
         builder = InlineKeyboardBuilder()
         for i, option in enumerate(q["options"]):
-            builder.button(text=f"{OPTION_LETTERS[i]}) {option}", callback_data=f"ans:{index}:{i}")
+            builder.button(text=f"{OPTION_LETTERS[i]}) {option}",
+                           callback_data=f"ans:{session['sid']}:{index}:{i}")
         builder.adjust(1)
-        builder.row(*nav_buttons(index, order))
+        builder.row(*nav_buttons(index, session))
         await send_question_message(message, q, header, builder.as_markup())
 
 
@@ -678,7 +701,11 @@ async def goto_question(callback: CallbackQuery) -> None:
     if user_id not in user_sessions:
         await callback.answer("Начните тест заново: нажмите «Квиз»", show_alert=True)
         return
-    index = int(callback.data.split(":", 1)[1])
+    parsed = parse_session_callback(callback)
+    if not parsed or len(parsed[1]) != 1:
+        await callback.answer(STALE_BUTTON_TEXT, show_alert=True)
+        return
+    _, (index,) = parsed
     await callback.answer()
     await show_question(user_id, callback.message, index)
 
@@ -701,9 +728,11 @@ async def check_answer(callback: CallbackQuery) -> None:
         await callback.answer("Начните тест заново: нажмите «Квиз»", show_alert=True)
         return
 
-    _, index_str, choice_str = callback.data.split(":")
-    index = int(index_str)
-    choice = int(choice_str)
+    parsed = parse_session_callback(callback)
+    if not parsed or len(parsed[1]) != 2:
+        await callback.answer(STALE_BUTTON_TEXT, show_alert=True)
+        return
+    _, (index, choice) = parsed
 
     if index in session["answers"]:
         await callback.answer("Вы уже отвечали на этот вопрос")
