@@ -1,4 +1,6 @@
 import asyncio
+import html
+import json
 import logging
 import os
 import random
@@ -71,6 +73,48 @@ dp = Dispatcher()
 #             "sid": метка сессии — пишется в callback кнопок вопросов}
 user_sessions: dict[int, dict] = {}
 
+MENU_CHANGED_TEXT = "Меню обновилось — открой его заново: «🧮 Квиз»"
+NO_SESSION_TEXT = "Начните тест заново: нажмите «Квиз»"
+
+
+def save_session(user_id: int) -> None:
+    """Сессия дублируется в БД, чтобы начатый тест переживал перезапуск бота (деплой)."""
+    s = user_sessions[user_id]
+    data = {**s, "answers": {str(k): v for k, v in s["answers"].items()}}
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR REPLACE INTO quiz_sessions (user_id, data, updated_at) VALUES (?, ?, ?)",
+        (user_id, json.dumps(data, ensure_ascii=False), datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_session(user_id: int) -> dict | None:
+    """Сессия из памяти, а после перезапуска — из БД. Если раздел за это время
+    исчез или из него убрали вопросы, старую сессию не восстанавливаем."""
+    if user_id in user_sessions:
+        return user_sessions[user_id]
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT data FROM quiz_sessions WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        s = json.loads(row[0])
+        s["answers"] = {int(k): int(v) for k, v in s["answers"].items()}
+        questions = TRACKS[s["track"]]["sections"][s["section"]]["questions"]
+        n = len(questions)
+        if not s["order"] or any(not 0 <= i < n for i in s["order"]) or any(
+            i not in s["order"] or not 0 <= c < len(questions[i]["options"])
+            for i, c in s["answers"].items()
+        ):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    user_sessions[user_id] = s
+    return s
+
 
 def get_section(track_key: str, section_key: str) -> dict:
     return TRACKS[track_key]["sections"][section_key]
@@ -137,6 +181,16 @@ def init_db() -> None:
         conn.execute("ALTER TABLE users ADD COLUMN last_activity_date TEXT")
     if "last_reminder_sent" not in existing_user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN last_reminder_sent TEXT")
+    # Текущий тест пользователя (порядок вопросов и ответы) — переживает перезапуск.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS quiz_sessions (
+            user_id INTEGER PRIMARY KEY,
+            data TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     # Донаты звёздами. charge_id нужен для возврата (refundStarPayment).
     conn.execute(
         """
@@ -458,7 +512,10 @@ async def back_to_tracks(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("track:"))
 async def choose_track(callback: CallbackQuery) -> None:
     track_key = callback.data.split(":", 1)[1]
-    track = TRACKS[track_key]
+    track = TRACKS.get(track_key)
+    if not track:
+        await callback.answer(MENU_CHANGED_TEXT, show_alert=True)
+        return
     sections = track["sections"]
     await callback.answer()
 
@@ -496,9 +553,12 @@ async def choose_track(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("group:"))
 async def choose_group(callback: CallbackQuery) -> None:
-    _, track_key, group_key = callback.data.split(":", 2)
-    track = TRACKS[track_key]
-    group = next(g for g in track["menu"] if g["key"] == group_key)
+    _, track_key, group_key = (callback.data.split(":", 2) + ["", ""])[:3]
+    track = TRACKS.get(track_key)
+    group = next((g for g in (track or {}).get("menu") or [] if g["key"] == group_key), None)
+    if not group:
+        await callback.answer(MENU_CHANGED_TEXT, show_alert=True)
+        return
     await callback.answer()
 
     group_sections = [(k, s) for k, s in track["sections"].items() if s.get("group") == group_key]
@@ -542,11 +602,11 @@ async def soon_section(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("section:"))
 async def choose_section(callback: CallbackQuery) -> None:
-    _, track_key, section_key = callback.data.split(":", 2)
+    _, track_key, section_key = (callback.data.split(":", 2) + ["", ""])[:3]
     section = TRACKS.get(track_key, {}).get("sections", {}).get(section_key)
     if not section or not section["questions"]:
         # Кнопка из старого сообщения: после перехода на номера заданий таких разделов нет.
-        await callback.answer("Разделы обновились — открой меню заново: «🧮 Квиз»", show_alert=True)
+        await callback.answer(MENU_CHANGED_TEXT, show_alert=True)
         return
     order = list(range(len(section["questions"])))
     random.shuffle(order)
@@ -557,12 +617,13 @@ async def choose_section(callback: CallbackQuery) -> None:
         "order": order,
         "sid": secrets.token_hex(3),
     }
+    save_session(callback.from_user.id)
     await callback.answer()
     await show_map(callback.from_user.id, callback.message)
 
 
 async def show_map(user_id: int, message: Message) -> None:
-    session = user_sessions[user_id]
+    session = get_session(user_id)
     section = get_session_section(session)
     questions = section["questions"]
     answers = session["answers"]
@@ -608,7 +669,7 @@ def parse_session_callback(callback: CallbackQuery) -> tuple[dict, list[int]] | 
     """Разбирает callback вида "q:<sid>:<i>" / "ans:<sid>:<i>:<c>". Кнопки содержат
     метку сессии, чтобы нажатие в старом сообщении (из другого раздела или прошлого
     прохода) не открывало и не засчитывало чужой вопрос текущего теста."""
-    session = user_sessions.get(callback.from_user.id)
+    session = get_session(callback.from_user.id)
     parts = callback.data.split(":")[1:]
     if not session or len(parts) < 2 or parts[0] != session["sid"]:
         return None
@@ -622,7 +683,10 @@ CAPTION_LIMIT = 1024
 
 
 def visible_length(html_text: str) -> int:
-    return len(re.sub(r"<[^>]+>", "", html_text))
+    """Длина текста так, как её считает Telegram: без тегов, с раскрытыми &lt; и
+    в единицах UTF-16 (эмодзи вроде 💡 занимают 2)."""
+    plain = html.unescape(re.sub(r"<[^<>]+>", "", html_text))
+    return len(plain.encode("utf-16-le")) // 2
 
 
 async def send_question_message(message: Message, q: dict, text: str, markup) -> None:
@@ -637,7 +701,7 @@ async def send_question_message(message: Message, q: dict, text: str, markup) ->
 
 
 async def show_question(user_id: int, message: Message, index: int) -> None:
-    session = user_sessions[user_id]
+    session = get_session(user_id)
     section = get_session_section(session)
     questions = section["questions"]
     order = session["order"]
@@ -698,8 +762,8 @@ async def show_question(user_id: int, message: Message, index: int) -> None:
 @dp.callback_query(F.data.startswith("q:"))
 async def goto_question(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    if user_id not in user_sessions:
-        await callback.answer("Начните тест заново: нажмите «Квиз»", show_alert=True)
+    if not get_session(user_id):
+        await callback.answer(NO_SESSION_TEXT, show_alert=True)
         return
     parsed = parse_session_callback(callback)
     if not parsed or len(parsed[1]) != 1:
@@ -713,8 +777,8 @@ async def goto_question(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "map")
 async def goto_map(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    if user_id not in user_sessions:
-        await callback.answer("Начните тест заново: нажмите «Квиз»", show_alert=True)
+    if not get_session(user_id):
+        await callback.answer(NO_SESSION_TEXT, show_alert=True)
         return
     await callback.answer()
     await show_map(user_id, callback.message)
@@ -723,9 +787,9 @@ async def goto_map(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("ans:"))
 async def check_answer(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    session = user_sessions.get(user_id)
+    session = get_session(user_id)
     if not session:
-        await callback.answer("Начните тест заново: нажмите «Квиз»", show_alert=True)
+        await callback.answer(NO_SESSION_TEXT, show_alert=True)
         return
 
     parsed = parse_session_callback(callback)
@@ -741,6 +805,7 @@ async def check_answer(callback: CallbackQuery) -> None:
     q = get_session_section(session)["questions"][index]
     is_correct = choice == q["correct"]
     session["answers"][index] = choice
+    save_session(user_id)
     record_answer(user_id, db_section_key(session["track"], session["section"]), is_correct)
     touch_user(user_id, callback.from_user.full_name)
     update_streak(user_id)
@@ -756,9 +821,9 @@ async def check_answer(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "finish")
 async def finish_quiz(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    session = user_sessions.get(user_id)
+    session = get_session(user_id)
     if not session:
-        await callback.answer("Начните тест заново: нажмите «Квиз»", show_alert=True)
+        await callback.answer(NO_SESSION_TEXT, show_alert=True)
         return
     await callback.answer()
 
@@ -863,7 +928,8 @@ async def choose_donation(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("donate:"))
 async def send_donation_invoice(callback: CallbackQuery) -> None:
-    amount = int(callback.data.split(":", 1)[1])
+    raw_amount = callback.data.split(":", 1)[1]
+    amount = int(raw_amount) if raw_amount.isdigit() else 0
     if amount not in DONATE_AMOUNTS:
         await callback.answer()
         return
@@ -902,7 +968,7 @@ async def process_successful_payment(message: Message) -> None:
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"⭐ Донат: <b>{payment.total_amount}</b> от {message.from_user.full_name} "
+            f"⭐ Донат: <b>{payment.total_amount}</b> от {html.escape(message.from_user.full_name)} "
             f"(id {message.from_user.id})\ncharge_id: <code>{payment.telegram_payment_charge_id}</code>",
         )
     except Exception:
@@ -938,7 +1004,7 @@ async def cmd_refund(message: Message) -> None:
         return
     parts = (message.text or "").split()
     if len(parts) != 3 or not parts[1].isdigit():
-        await message.answer("Формат: /refund <user_id> <charge_id> (оба есть в уведомлении о донате)")
+        await message.answer("Формат: /refund &lt;user_id&gt; &lt;charge_id&gt; (оба есть в уведомлении о донате)")
         return
     user_id, charge_id = int(parts[1]), parts[2]
     try:
@@ -974,7 +1040,10 @@ async def cmd_admin(message: Message) -> None:
         f"📝 Ответов сегодня: <b>{stats['answers_today']}</b>\n\n"
         f"🏆 <b>Топ разделов по числу ответов:</b>\n{top_text}\n\n"
         f"⭐ <b>Поддержка:</b> {donations['count']} платежей, всего <b>{donations['stars']}</b> звёзд"
-        + "".join(f"\n· {name}: {stars} ⭐ ({created[:10]})" for name, stars, created in donations["last"])
+        + "".join(
+            f"\n· {html.escape(name or '?')}: {stars} ⭐ ({created[:10]})"
+            for name, stars, created in donations["last"]
+        )
     )
 
 

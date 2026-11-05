@@ -67,6 +67,16 @@ for track_key, track in Q.TRACKS.items():
                     errors.append(f"{where}: нет файла {q[field]}")
             if not q.get("explanation"):
                 errors.append(f"{where}: нет объяснения")
+            # Текст уходит в Telegram как HTML: «a < b» ломает разметку — писать «&lt;».
+            for field in ("text", "explanation", "source"):
+                value = q.get(field) or ""
+                if re.search(r"<(?!/?(b|i|u|s|pre|code|a)( [^<>]*)?>)", value):
+                    errors.append(f"{where}: в {field} знак «<» — замените на &lt;")
+                if re.search(r"&(?!(#\d+|#x[0-9a-fA-F]+|lt|gt|amp|quot);)", value):
+                    errors.append(f"{where}: в {field} знак «&» — замените на &amp;")
+            for o in opts:
+                if re.search(r"&(lt|gt|amp|quot);|</?b>", o):
+                    errors.append(f"{where}: HTML в варианте ответа (на кнопке покажется как есть): {o}")
             text_len = len(visible(q["text"]))
             if text_len > MESSAGE_LIMIT - 200:
                 errors.append(f"{where}: текст {text_len} симв. — не влезет в сообщение")
