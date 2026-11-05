@@ -643,20 +643,25 @@ async def show_question(user_id: int, message: Message, index: int) -> None:
             text += f"\n\n📚 <i>Источник: {source}</i>"
         builder = InlineKeyboardBuilder()
         builder.row(*nav_buttons(index, order))
-        await send_question_message(message, q, text, builder.as_markup())
+        markup = builder.as_markup()
 
+        # После ответа могут прийти ещё картинки: формула и решение (например, фото
+        # собранной установки в ОГЭ №17). Кнопки навигации вешаем на последнее
+        # сообщение, чтобы они не уезжали вверх над картинками.
+        extras = []
         formula_latex = q.get("formula")
         if formula_latex:
-            await message.answer_photo(
-                photo=FSInputFile(render_formula(formula_latex)),
-                caption="📐 <b>Формула</b>",
-            )
-
+            extras.append((render_formula(formula_latex), "📐 <b>Формула</b>"))
         solution_image = q.get("solution_image")
         if solution_image:
+            extras.append((solution_image, "✏️ <b>Решение</b>"))
+
+        await send_question_message(message, q, text, None if extras else markup)
+        for k, (path, caption) in enumerate(extras):
             await message.answer_photo(
-                photo=FSInputFile(solution_image),
-                caption="✏️ <b>Решение</b>",
+                photo=FSInputFile(path),
+                caption=caption,
+                reply_markup=markup if k == len(extras) - 1 else None,
             )
     else:
         builder = InlineKeyboardBuilder()
