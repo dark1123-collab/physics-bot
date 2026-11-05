@@ -176,6 +176,7 @@ ROUTES = [
     (lambda d: d.startswith("ans:"), bot.check_answer),
     (lambda d: d == "finish", bot.finish_quiz),
     (lambda d: d == "donate", bot.choose_donation),
+    (lambda d: d == "mistakes", bot.mistakes_callback),
     (lambda d: d.startswith("donate:"), bot.send_donation_invoice),
 ]
 
@@ -335,6 +336,79 @@ async def test_restart(sections: list[str]) -> None:
             fail(f"[{context[0]}] ▶️ из сообщения до перезапуска не работает")
 
 
+async def test_mistakes(sections: list[str]) -> None:
+    """Работа над ошибками: ошибки попадают в список, верный ответ убирает вопрос,
+    ответ пишется в родной раздел вопроса."""
+    context[0] = "ошибки"
+    user = SimpleNamespace(id=5005, full_name="Ошибающийся")
+    out = await send_text(bot.cmd_mistakes, user=user)
+    if not out or "нет" not in out[0].text:
+        fail("[ошибки] без ошибок не сказано, что разбирать нечего")
+
+    # отвечаем неверно на 3 вопроса раздела и верно на 1
+    data = next(s for s in sections if s.endswith(":task09"))
+    await press(data, user)
+    session = bot.user_sessions[user.id]
+    questions = bot.get_session_section(session)["questions"]
+    wrong_ids = []
+    for n, i in enumerate(session["order"][:4]):
+        q = questions[i]
+        choice = q["correct"] if n == 3 else (q["correct"] + 1) % 4
+        await press(f"ans:{session['sid']}:{i}:{choice}", user)
+        if n < 3:
+            wrong_ids.append(q["id"])
+    if set(bot.get_mistakes(user.id)) != set(wrong_ids):
+        fail(f"[ошибки] список ошибок {bot.get_mistakes(user.id)} ≠ {wrong_ids}")
+
+    finish = await press("finish", user)
+    if not finish or "mistakes" not in finish[-1].callbacks():
+        fail("[ошибки] в итоге нет кнопки «Работа над ошибками»")
+
+    out = await press("mistakes", user)
+    ms = bot.user_sessions[user.id]
+    if ms["track"] != bot.MISTAKES_TRACK or ms["qids"] != bot.get_mistakes(user.id):
+        fail("[ошибки] сессия работы над ошибками собрана неверно")
+    if len([c for s in out for c in s.callbacks() if c.startswith("q:")]) != 3:
+        fail("[ошибки] в списке не 3 вопроса")
+
+    # проходим все вопросы режима: открыть → ответить верно, проверить заголовок и раздел записи
+    for pos, i in enumerate(ms["order"]):
+        context[0] = f"ошибки вопрос {pos + 1}"
+        shown = await press(f"q:{ms['sid']}:{i}", user)
+        if not shown or "📍" not in (shown[-1].text or shown[0].text):
+            fail(f"[{context[0]}] не показано, из какого номера вопрос")
+        q = bot.get_session_section(ms)["questions"][i]
+        await press(f"ans:{ms['sid']}:{i}:{q['correct']}", user)
+    conn = sqlite3.connect(bot.DB_PATH)
+    sections_written = {r[0] for r in conn.execute(
+        "SELECT section FROM answers WHERE user_id=?", (user.id,))}
+    conn.close()
+    if sections_written != {data.split(":", 1)[1]}:
+        fail(f"[ошибки] ответы записаны не в родной раздел: {sections_written}")
+    if bot.get_mistakes(user.id):
+        fail("[ошибки] после верных ответов ошибки остались в списке")
+    finish = await press("finish", user)
+    if not finish or "Все ошибки разобраны" not in finish[-1].text:
+        fail("[ошибки] итог не сообщает, что всё разобрано")
+
+    # перезапуск посреди работы над ошибками
+    context[0] = "ошибки + перезапуск"
+    await press(data, user)
+    s2 = bot.user_sessions[user.id]
+    i = s2["order"][0]
+    q = bot.get_session_section(s2)["questions"][i]
+    await press(f"ans:{s2['sid']}:{i}:{(q['correct'] + 1) % 4}", user)
+    await press("mistakes", user)
+    bot.user_sessions.clear()
+    if not await press("map", user) or bot.user_sessions[user.id]["track"] != bot.MISTAKES_TRACK:
+        fail("[ошибки] после перезапуска работа над ошибками не восстановилась")
+
+    # статистика показывает число ошибок и кнопку
+    out = await send_text(bot.cmd_stats, user=user)
+    if not out or "Ошибок к разбору: <b>1</b>" not in out[0].text or "mistakes" not in out[0].callbacks():
+        fail("[ошибки] в статистике нет числа ошибок или кнопки")
+
+
 async def test_stats_and_streak() -> None:
     context[0] = "статистика"
     new_user = SimpleNamespace(id=2002, full_name="Новичок")
@@ -440,6 +514,7 @@ async def main() -> None:
         await test_section(data, rng)
     await test_stale_buttons(sections)
     await test_restart(sections)
+    await test_mistakes(sections)
     await test_stats_and_streak()
     await test_misc_commands()
 

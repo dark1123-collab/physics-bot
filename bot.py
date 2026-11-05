@@ -28,7 +28,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from formula_render import render_formula
-from questions import LEGACY_SECTION_TITLES, TRACKS
+from questions import LEGACY_SECTION_TITLES, QUESTION_INDEX, TRACKS
 
 # Токен читается из переменной окружения BOT_TOKEN (так задаётся на хостинге).
 # Для удобного локального запуска, если переменной окружения нет, берётся
@@ -55,10 +55,11 @@ DONATE_AMOUNTS = [10, 25, 50, 100, 250, 500]  # варианты суммы в T
 
 QUIZ_BUTTON = "🧮 Квиз"
 STATS_BUTTON = "📊 Статистика"
+MISTAKES_BUTTON = "🔁 Работа над ошибками"
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=QUIZ_BUTTON), KeyboardButton(text=STATS_BUTTON)],
-        [KeyboardButton(text=DONATE_BUTTON)],
+        [KeyboardButton(text=MISTAKES_BUTTON), KeyboardButton(text=DONATE_BUTTON)],
     ],
     resize_keyboard=True,
 )
@@ -71,7 +72,12 @@ dp = Dispatcher()
 # user_id -> {"track": str, "section": str, "answers": {question_index: chosen_option_index},
 #             "order": [shuffled question indices],
 #             "sid": метка сессии — пишется в callback кнопок вопросов}
+# «Работа над ошибками» — сессия с track = MISTAKES_TRACK и списком id вопросов "qids".
 user_sessions: dict[int, dict] = {}
+
+MISTAKES_TRACK = "mistakes"
+MISTAKES_TITLE = "🔁 Работа над ошибками"
+MISTAKES_LIMIT = 40  # за один заход — не больше стольких вопросов (самые свежие ошибки)
 
 MENU_CHANGED_TEXT = "Меню обновилось — открой его заново: «🧮 Квиз»"
 NO_SESSION_TEXT = "Начните тест заново: нажмите «Квиз»"
@@ -103,7 +109,7 @@ def get_session(user_id: int) -> dict | None:
     try:
         s = json.loads(row[0])
         s["answers"] = {int(k): int(v) for k, v in s["answers"].items()}
-        questions = TRACKS[s["track"]]["sections"][s["section"]]["questions"]
+        questions = get_session_section(s)["questions"]
         n = len(questions)
         if not s["order"] or any(not 0 <= i < n for i in s["order"]) or any(
             i not in s["order"] or not 0 <= c < len(questions[i]["options"])
@@ -121,11 +127,32 @@ def get_section(track_key: str, section_key: str) -> dict:
 
 
 def get_session_section(session: dict) -> dict:
+    if session["track"] == MISTAKES_TRACK:
+        # KeyError, если вопрос из списка ошибок с тех пор удалили/переписали.
+        return {"title": MISTAKES_TITLE, "questions": [QUESTION_INDEX[qid][2] for qid in session["qids"]]}
     return get_section(session["track"], session["section"])
 
 
 def db_section_key(track_key: str, section_key: str) -> str:
     return f"{track_key}:{section_key}"
+
+
+def answer_section_key(session: dict, q: dict) -> str:
+    """Раздел, в который записать ответ. В «Работе над ошибками» — родной раздел
+    вопроса, чтобы статистика по номерам оставалась правильной."""
+    if session["track"] == MISTAKES_TRACK and q.get("id") in QUESTION_INDEX:
+        track_key, section_key, _ = QUESTION_INDEX[q["id"]]
+        return db_section_key(track_key, section_key)
+    return db_section_key(session["track"], session["section"])
+
+
+def question_origin(q: dict) -> str:
+    """«🎓 ЕГЭ · №9 …» — откуда вопрос (показываем в работе над ошибками)."""
+    if q.get("id") not in QUESTION_INDEX:
+        return ""
+    track_key, section_key, _ = QUESTION_INDEX[q["id"]]
+    track = TRACKS[track_key]
+    return f"{track['title']} · {track['sections'][section_key]['title']}"
 
 
 def section_title(db_key: str) -> str:
@@ -172,6 +199,10 @@ def init_db() -> None:
     existing_columns = [row[1] for row in conn.execute("PRAGMA table_info(answers)")]
     if "created_at" not in existing_columns:
         conn.execute("ALTER TABLE answers ADD COLUMN created_at TEXT")
+    if "question_id" not in existing_columns:
+        # id вопроса (см. questions.QUESTION_INDEX); у старых ответов — NULL.
+        conn.execute("ALTER TABLE answers ADD COLUMN question_id TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS answers_user ON answers (user_id, id)")
     existing_user_columns = [row[1] for row in conn.execute("PRAGMA table_info(users)")]
     if "current_streak" not in existing_user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN current_streak INTEGER NOT NULL DEFAULT 0")
@@ -371,14 +402,30 @@ def get_streak_reminder_users() -> list[tuple[int, int]]:
     return rows
 
 
-def record_answer(user_id: int, section: str, correct: bool) -> None:
+def record_answer(user_id: int, section: str, correct: bool, question_id: str | None = None) -> None:
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO answers (user_id, section, correct, created_at) VALUES (?, ?, ?, ?)",
-        (user_id, section, int(correct), datetime.utcnow().isoformat()),
+        "INSERT INTO answers (user_id, section, correct, created_at, question_id) VALUES (?, ?, ?, ?, ?)",
+        (user_id, section, int(correct), datetime.utcnow().isoformat(), question_id),
     )
     conn.commit()
     conn.close()
+
+
+def get_mistakes(user_id: int) -> list[str]:
+    """id вопросов, на которые последний ответ пользователя был неверным
+    (самые свежие ошибки первыми). Вопрос уходит из списка, как только на него
+    ответили верно — в любом разделе."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT question_id, correct FROM answers WHERE user_id = ? AND question_id IS NOT NULL ORDER BY id DESC",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    latest: dict[str, int] = {}
+    for qid, correct in rows:
+        latest.setdefault(qid, correct)
+    return [qid for qid, correct in latest.items() if not correct and qid in QUESTION_INDEX]
 
 
 def get_admin_stats() -> dict:
@@ -644,7 +691,11 @@ async def show_map(user_id: int, message: Message) -> None:
     text = (
         f"<b>{section['title']}</b>\n"
         f"Отвечено: {len(answers)}/{len(questions)} · Правильно: {correct}\n\n"
-        f"📋 Выберите вопрос (порядок перемешан):"
+        + (
+            "📋 Сначала самые свежие ошибки. Ответишь верно — вопрос уйдёт из списка:"
+            if session["track"] == MISTAKES_TRACK
+            else "📋 Выберите вопрос (порядок перемешан):"
+        )
     )
     await message.answer(text, reply_markup=builder.as_markup())
 
@@ -710,7 +761,10 @@ async def show_question(user_id: int, message: Message, index: int) -> None:
     q = questions[index]
     answers = session["answers"]
 
-    header = f"<b>{section['title']}</b> · Вопрос {position + 1}/{total}\n\n❓ {q['text']}"
+    header = f"<b>{section['title']}</b> · Вопрос {position + 1}/{total}"
+    if session["track"] == MISTAKES_TRACK:
+        header += f"\n📍 <i>{question_origin(q)}</i>"
+    header += f"\n\n❓ {q['text']}"
 
     if index in answers:
         chosen = answers[index]
@@ -806,7 +860,7 @@ async def check_answer(callback: CallbackQuery) -> None:
     is_correct = choice == q["correct"]
     session["answers"][index] = choice
     save_session(user_id)
-    record_answer(user_id, db_section_key(session["track"], session["section"]), is_correct)
+    record_answer(user_id, answer_section_key(session, q), is_correct, q.get("id"))
     touch_user(user_id, callback.from_user.full_name)
     update_streak(user_id)
 
@@ -840,18 +894,67 @@ async def finish_quiz(callback: CallbackQuery) -> None:
 
     builder = InlineKeyboardBuilder()
     builder.button(text="📋 К списку вопросов", callback_data="map")
+    mistakes_left = len(get_mistakes(user_id))
+    if mistakes_left:
+        builder.row(InlineKeyboardButton(text=f"{MISTAKES_BUTTON} · {mistakes_left}", callback_data="mistakes"))
     builder.row(InlineKeyboardButton(text="📢 Канал с разборами и мотивацией", url=CHANNEL_URL))
     builder.row(InlineKeyboardButton(text=DONATE_BUTTON, callback_data="donate"))
 
+    if session["track"] == MISTAKES_TRACK:
+        title = "🏁 <b>Итог работы над ошибками</b>"
+        tail = (
+            f"Исправлено: <b>{score}</b>. Осталось ошибок к разбору: <b>{mistakes_left}</b>."
+            if mistakes_left else "🎉 Все ошибки разобраны!"
+        )
+    else:
+        title = f"🏁 <b>Итог по разделу «{section['title']}»</b>"
+        tail = "Выбери другой раздел — кнопка 🧮 Квиз"
+
     await callback.message.answer(
-        f"🏁 <b>Итог по разделу «{section['title']}»</b>\n\n"
+        f"{title}\n\n"
         f"{progress_bar(score, total)}\n"
         f"Результат: <b>{score}/{total}</b> ({percentage}%){note}\n\n"
         f"{result_tier(percentage)}\n\n"
-        f"Выбери другой раздел — кнопка 🧮 Квиз\n"
+        f"{tail}\n"
         f"А чтобы не терять мотивацию между тренировками — подпишись на @nicholas_physics 👇",
         reply_markup=builder.as_markup(),
     )
+
+
+async def start_mistakes(user_id: int, message: Message) -> None:
+    qids = get_mistakes(user_id)[:MISTAKES_LIMIT]
+    if not qids:
+        await message.answer(
+            "🔁 <b>Работа над ошибками</b>\n\n"
+            "Ошибок к разбору нет 🎉\n\n"
+            "Сюда попадают вопросы, на которые ты ответил неверно. "
+            "Ответишь на такой вопрос верно — он уйдёт из списка.\n\n"
+            "Жми 🧮 Квиз и тренируйся!"
+        )
+        return
+    user_sessions[user_id] = {
+        "track": MISTAKES_TRACK,
+        "section": "all",
+        "qids": qids,
+        "answers": {},
+        "order": list(range(len(qids))),
+        "sid": secrets.token_hex(3),
+    }
+    save_session(user_id)
+    await show_map(user_id, message)
+
+
+@dp.message(Command("mistakes"))
+@dp.message(F.text == MISTAKES_BUTTON)
+async def cmd_mistakes(message: Message) -> None:
+    touch_user(message.from_user.id, message.from_user.full_name)
+    await start_mistakes(message.from_user.id, message)
+
+
+@dp.callback_query(F.data == "mistakes")
+async def mistakes_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    await start_mistakes(callback.from_user.id, callback.message)
 
 
 @dp.message(Command("stats"))
@@ -880,6 +983,12 @@ async def cmd_stats(message: Message) -> None:
             pct = round(s["correct"] / s["total"] * 100)
             lines.append(f"{section_title(db_key)}: <b>{s['correct']}/{s['total']}</b> ({pct}%)")
     breakdown = "\n".join(lines)
+    mistakes_left = len(get_mistakes(message.from_user.id))
+    stats_markup = InlineKeyboardBuilder()
+    if mistakes_left:
+        stats_markup.button(text=f"{MISTAKES_BUTTON} · {mistakes_left}", callback_data="mistakes")
+    stats_markup.button(text=DONATE_BUTTON, callback_data="donate")
+    stats_markup.adjust(1)
 
     await message.answer(
         "📊 <b>Твоя статистика</b>\n\n"
@@ -887,10 +996,11 @@ async def cmd_stats(message: Message) -> None:
         f"Отвечено вопросов: <b>{stats['total']}</b>\n"
         f"Правильно: <b>{stats['correct']}</b>\n"
         f"Точность: <b>{accuracy}%</b>\n"
-        f"{streak_line}\n\n"
+        f"{streak_line}\n"
+        f"🔁 Ошибок к разбору: <b>{mistakes_left}</b>\n\n"
         f"{result_tier(accuracy)}\n\n"
         f"📚 <b>По разделам:</b>\n{breakdown}",
-        reply_markup=InlineKeyboardBuilder().button(text=DONATE_BUTTON, callback_data="donate").as_markup(),
+        reply_markup=stats_markup.as_markup(),
     )
 
 
@@ -1088,6 +1198,7 @@ async def main() -> None:
     await bot.set_my_commands([
         BotCommand(command="quiz", description="🧮 Квиз"),
         BotCommand(command="stats", description="📊 Статистика"),
+        BotCommand(command="mistakes", description="🔁 Работа над ошибками"),
         BotCommand(command="donate", description="⭐ Поддержать бота"),
         BotCommand(command="paysupport", description="Вопросы по оплате"),
         BotCommand(command="terms", description="Условия"),

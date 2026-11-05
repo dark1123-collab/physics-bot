@@ -11,6 +11,7 @@
 номер с задачами сам появится в меню, пустой номер показывается с пометкой «скоро».
 Формат вопроса — см. questions/README.md.
 """
+import hashlib
 import importlib
 
 from .grades_7_9 import GRADES_7_9_SECTIONS
@@ -92,6 +93,21 @@ TRACKS = {
     "oge": {"title": "📘 ОГЭ", "sections": OGE_SECTIONS, "menu": OGE_MENU},
     "grades_7_9": {"title": "📗 7-9 класс", "sections": GRADES_7_9_SECTIONS},
 }
+
+AGGREGATE_SECTIONS = ("hard", "formulas")
+
+# Постоянный id вопроса — по тексту (номера в списке меняются при добавлении задач).
+# Нужен «Работе над ошибками»: в stats.db ответ пишется вместе с id вопроса.
+# QUESTION_INDEX: id -> (трек, раздел, вопрос); раздел — «родной», не марафон.
+QUESTION_INDEX = {}
+for _track_key, _track in TRACKS.items():
+    for _section_key, _section in _track["sections"].items():
+        if _section_key in AGGREGATE_SECTIONS:
+            continue
+        for _q in _section["questions"]:
+            _qid = f"{_track_key}:" + hashlib.sha1(_q["text"].encode("utf-8")).hexdigest()[:10]
+            _q.setdefault("id", _qid)
+            QUESTION_INDEX.setdefault(_q["id"], (_track_key, _section_key, _q))
 
 # Разделы, которые были до перехода на номера заданий. Старые ответы в stats.db
 # записаны с этими ключами — по ним статистика показывается с понятными названиями.
