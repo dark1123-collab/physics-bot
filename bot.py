@@ -782,6 +782,11 @@ async def show_question(user_id: int, message: Message, index: int) -> None:
         if source:
             text += f"\n\n📚 <i>Источник: {source}</i>"
         builder = InlineKeyboardBuilder()
+        if q.get("solution") or q.get("solution_images"):
+            # Задачи 2 части: подробное решение длинное — показываем по кнопке,
+            # чтобы не заваливать чат (см. send_full_solution).
+            builder.row(InlineKeyboardButton(
+                text="📖 Полное решение", callback_data=f"sol:{session['sid']}:{index}"))
         builder.row(*nav_buttons(index, session))
         markup = builder.as_markup()
 
@@ -826,6 +831,64 @@ async def goto_question(callback: CallbackQuery) -> None:
     _, (index,) = parsed
     await callback.answer()
     await show_question(user_id, callback.message, index)
+
+
+MESSAGE_LIMIT = 4096
+
+
+def split_message(text: str, limit: int = MESSAGE_LIMIT - 96) -> list[str]:
+    """Режет длинный HTML-текст на куски по абзацам (пустая строка), не разрывая
+    абзац — а значит, и теги внутри него (<pre>-таблицы пишем одним абзацем)."""
+    chunks, current = [], ""
+    for para in text.split("\n\n"):
+        candidate = f"{current}\n\n{para}" if current else para
+        if current and visible_length(candidate) > limit:
+            chunks.append(current)
+            current = para
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def send_full_solution(message: Message, q: dict, markup) -> None:
+    """Подробное решение: текст (при необходимости в несколько сообщений), затем
+    картинки из решения. Навигация — на последнем сообщении."""
+    parts = []
+    if q.get("solution"):
+        chunks = split_message("📖 <b>Решение</b>\n\n" + q["solution"])
+        parts += [("text", c) for c in chunks]
+    images = q.get("solution_images") or []
+    parts += [("photo", p) for p in images]
+    for k, (kind, value) in enumerate(parts):
+        last = markup if k == len(parts) - 1 else None
+        if kind == "text":
+            await message.answer(value, reply_markup=last)
+        else:
+            caption = "✏️ Рисунок к решению" + (f" ({images.index(value) + 1}/{len(images)})" if len(images) > 1 else "")
+            await message.answer_photo(photo=FSInputFile(value), caption=caption, reply_markup=last)
+
+
+@dp.callback_query(F.data.startswith("sol:"))
+async def show_full_solution(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    session = get_session(user_id)
+    if not session:
+        await callback.answer(NO_SESSION_TEXT, show_alert=True)
+        return
+    parsed = parse_session_callback(callback)
+    if not parsed or len(parsed[1]) != 1:
+        await callback.answer(STALE_BUTTON_TEXT, show_alert=True)
+        return
+    _, (index,) = parsed
+    if index not in session["answers"]:
+        await callback.answer("Сначала выбери ответ — решение откроется после него", show_alert=True)
+        return
+    await callback.answer()
+    builder = InlineKeyboardBuilder()
+    builder.row(*nav_buttons(index, session))
+    await send_full_solution(callback.message, get_session_section(session)["questions"][index], builder.as_markup())
 
 
 @dp.callback_query(F.data == "map")

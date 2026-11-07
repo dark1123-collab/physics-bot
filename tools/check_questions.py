@@ -65,10 +65,17 @@ for track_key, track in Q.TRACKS.items():
             for field in ("image", "solution_image"):
                 if q.get(field) and not os.path.exists(q[field]):
                     errors.append(f"{where}: нет файла {q[field]}")
+            for path in q.get("solution_images") or []:
+                if not os.path.exists(path):
+                    errors.append(f"{where}: нет файла {path}")
+            # Полное решение (2 часть) бот режет по абзацам — один абзац должен влезать в сообщение.
+            for para in (q.get("solution") or "").split("\n\n"):
+                if len(visible(para)) > MESSAGE_LIMIT - 200:
+                    errors.append(f"{where}: абзац решения длиннее {MESSAGE_LIMIT - 200} симв.")
             if not q.get("explanation"):
                 errors.append(f"{where}: нет объяснения")
             # Текст уходит в Telegram как HTML: «a < b» ломает разметку — писать «&lt;».
-            for field in ("text", "explanation", "source"):
+            for field in ("text", "explanation", "source", "solution"):
                 value = q.get(field) or ""
                 if re.search(r"<(?!/?(b|i|u|s|pre|code|a)( [^<>]*)?>)", value):
                     errors.append(f"{where}: в {field} знак «<» — замените на &lt;")

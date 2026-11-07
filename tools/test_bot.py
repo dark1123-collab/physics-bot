@@ -177,6 +177,7 @@ ROUTES = [
     (lambda d: d == "finish", bot.finish_quiz),
     (lambda d: d == "donate", bot.choose_donation),
     (lambda d: d == "mistakes", bot.mistakes_callback),
+    (lambda d: d.startswith("sol:"), bot.show_full_solution),
     (lambda d: d.startswith("donate:"), bot.send_donation_invoice),
 ]
 
@@ -273,6 +274,18 @@ async def test_section(data: str, rng: random.Random) -> None:
             fail(f"[{context[0]}] не показана картинка решения")
         if q.get("formula") and not any(s.kind == "photo" and "Формула" in s.text for s in after):
             fail(f"[{context[0]}] не показана формула")
+        sol_buttons = [c for s in after for c in s.callbacks() if c.startswith("sol:")]
+        if bool(sol_buttons) != bool(q.get("solution") or q.get("solution_images")):
+            fail(f"[{context[0]}] кнопка «Полное решение» есть/нет не по данным вопроса")
+        if sol_buttons:
+            sol = await press(sol_buttons[0])
+            photos = [s.photo for s in sol if s.kind == "photo"]
+            if len(photos) != len(q.get("solution_images") or []):
+                fail(f"[{context[0]}] в полном решении не все картинки")
+            if q.get("solution") and not any("Решение" in s.text for s in sol if s.kind == "text"):
+                fail(f"[{context[0]}] не показан текст решения")
+            if not sol or not any(c.startswith("q:") or c == "map" for c in sol[-1].callbacks()):
+                fail(f"[{context[0]}] после полного решения нет навигации")
         # повторное нажатие ответа не должно засчитываться второй раз
         alerts.clear()
         await press(answer_buttons[(choice + 1) % 4])
