@@ -254,6 +254,17 @@ async def test_section(data: str, rng: random.Random) -> None:
         if len(answer_buttons) != 4:
             fail(f"[{context[0]}] кнопок ответа {len(answer_buttons)}, нужно 4")
             continue
+        # Длинные варианты не должны обрезаться на телефоне: либо кнопка короткая,
+        # либо вариант целиком напечатан в тексте вопроса.
+        q_shown = questions[int(answer_buttons[0].split(":")[2])]
+        texts = [b.text for s in shown if s.markup for row in s.markup.inline_keyboard for b in row
+                 if (b.callback_data or "").startswith("ans:")]
+        if any(len(t) > bot.BUTTON_FIT for t in texts):
+            fail(f"[{context[0]}] текст кнопки ответа не влезет на телефоне: {max(texts, key=len)}")
+        if not bot.options_fit_buttons(q_shown["options"]):
+            body = " ".join(s.text for s in shown)
+            if not all(o in body for o in q_shown["options"]):
+                fail(f"[{context[0]}] длинные варианты не напечатаны в тексте вопроса")
         choice = rng.randrange(4)
         index = int(answer_buttons[choice].split(":")[2])
         q = questions[index]

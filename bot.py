@@ -731,6 +731,12 @@ def parse_session_callback(callback: CallbackQuery) -> tuple[dict, list[int]] | 
 
 
 CAPTION_LIMIT = 1024
+# Сколько символов кнопки «А) вариант» видно на телефоне без обрезки «…».
+BUTTON_FIT = 30
+
+
+def options_fit_buttons(options: list[str]) -> bool:
+    return all(len(option) + 3 <= BUTTON_FIT for option in options)
 
 
 def visible_length(html_text: str) -> int:
@@ -810,10 +816,19 @@ async def show_question(user_id: int, message: Message, index: int) -> None:
             )
     else:
         builder = InlineKeyboardBuilder()
-        for i, option in enumerate(q["options"]):
-            builder.button(text=f"{OPTION_LETTERS[i]}) {option}",
-                           callback_data=f"ans:{session['sid']}:{index}:{i}")
-        builder.adjust(1)
+        if options_fit_buttons(q["options"]):
+            for i, option in enumerate(q["options"]):
+                builder.button(text=f"{OPTION_LETTERS[i]}) {option}",
+                               callback_data=f"ans:{session['sid']}:{index}:{i}")
+            builder.adjust(1)
+        else:
+            # На телефоне длинный вариант обрезается в кнопке «…». Тогда варианты
+            # пишем в тексте вопроса, а кнопки — одни буквы в один ряд.
+            header += "\n\n" + "\n".join(
+                f"<b>{OPTION_LETTERS[i]})</b> {option}" for i, option in enumerate(q["options"]))
+            for i in range(len(q["options"])):
+                builder.button(text=OPTION_LETTERS[i], callback_data=f"ans:{session['sid']}:{index}:{i}")
+            builder.adjust(len(q["options"]))
         builder.row(*nav_buttons(index, session))
         await send_question_message(message, q, header, builder.as_markup())
 
