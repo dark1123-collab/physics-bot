@@ -524,6 +524,35 @@ async def test_misc_commands() -> None:
     if 4004 in bot.get_inactive_users():
         fail("[напоминания] напоминание повторяется сразу")
 
+    # старая нижняя клавиатура обновляется один раз, у новых пользователей — не дублируется
+    context[0] = "клавиатура"
+    calls = []
+
+    async def handler(message, data):
+        calls.append(message.text)
+
+    old_user = SimpleNamespace(id=5005, full_name="Старый")
+    bot.touch_user(old_user.id, old_user.full_name)  # keyboard_version = 0, как у старых
+    for _ in range(2):
+        msg = FakeMessage(old_user)
+        msg.text = bot.QUIZ_BUTTON
+        start = len(outbox)
+        await bot.refresh_main_keyboard(handler, msg, {})
+        sent = outbox[start:]
+        if _ == 0 and not any(bot.MISTAKES_BUTTON in str(x.__dict__) for x in sent):
+            fail("[клавиатура] старому пользователю не пришла новая клавиатура")
+        if _ == 1 and sent:
+            fail("[клавиатура] новая клавиатура приходит повторно")
+    if len(calls) != 2:
+        fail("[клавиатура] после обновления клавиатуры команда не выполнилась")
+    start = len(outbox)
+    await send_text(bot.cmd_start, "/start")  # USER: /start уже прислал клавиатуру
+    msg = FakeMessage(USER)
+    msg.text = bot.QUIZ_BUTTON
+    await bot.refresh_main_keyboard(handler, msg, {})
+    if len(outbox) - start != 2:
+        fail("[клавиатура] после /start клавиатура прислана ещё раз")
+
 
 async def main() -> None:
     tmp = tempfile.mkdtemp(prefix="physbot-test-")

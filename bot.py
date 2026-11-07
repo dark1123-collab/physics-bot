@@ -63,11 +63,30 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+# Telegram держит у пользователя ту нижнюю клавиатуру, которую бот прислал последней.
+# При изменении MAIN_KEYBOARD увеличьте версию — старым пользователям клавиатура
+# обновится сама при следующем сообщении (см. KeyboardRefreshMiddleware).
+KEYBOARD_VERSION = 2
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+
+
+@dp.message.outer_middleware()
+async def refresh_main_keyboard(handler, message: Message, data: dict):
+    """Если у пользователя старая нижняя клавиатура (без новых кнопок) — присылаем новую."""
+    user = message.from_user
+    if user and not (message.text or "").startswith("/start") and keyboard_outdated(user.id):
+        try:
+            await message.answer(
+                "🔄 Меню обновлено — внизу появилась кнопка «🔁 Работа над ошибками».",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        except Exception:
+            logging.exception("Не удалось обновить клавиатуру пользователю %s", user.id)
+    return await handler(message, data)
 
 # user_id -> {"track": str, "section": str, "answers": {question_index: chosen_option_index},
 #             "order": [shuffled question indices],
@@ -212,6 +231,8 @@ def init_db() -> None:
         conn.execute("ALTER TABLE users ADD COLUMN last_activity_date TEXT")
     if "last_reminder_sent" not in existing_user_columns:
         conn.execute("ALTER TABLE users ADD COLUMN last_reminder_sent TEXT")
+    if "keyboard_version" not in existing_user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN keyboard_version INTEGER NOT NULL DEFAULT 0")
     # Текущий тест пользователя (порядок вопросов и ответы) — переживает перезапуск.
     conn.execute(
         """
@@ -267,6 +288,25 @@ def get_donation_stats() -> dict:
     ).fetchall()
     conn.close()
     return {"count": count, "stars": stars, "last": last}
+
+
+def keyboard_outdated(user_id: int) -> bool:
+    """True, если у пользователя старая нижняя клавиатура; сразу помечает её обновлённой."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT keyboard_version FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    outdated = row is not None and row[0] < KEYBOARD_VERSION
+    if outdated:
+        conn.execute("UPDATE users SET keyboard_version = ? WHERE user_id = ?", (KEYBOARD_VERSION, user_id))
+        conn.commit()
+    conn.close()
+    return outdated
+
+
+def mark_keyboard_sent(user_id: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE users SET keyboard_version = ? WHERE user_id = ?", (KEYBOARD_VERSION, user_id))
+    conn.commit()
+    conn.close()
 
 
 def touch_user(user_id: int, full_name: str) -> None:
@@ -512,6 +552,7 @@ async def cmd_start(message: Message) -> None:
         "Пользуйся кнопками внизу 👇",
         reply_markup=MAIN_KEYBOARD,
     )
+    mark_keyboard_sent(message.from_user.id)
 
     channel_builder = InlineKeyboardBuilder()
     channel_builder.button(text="📢 Перейти в канал", url=CHANNEL_URL)
@@ -526,10 +567,13 @@ async def cmd_start(message: Message) -> None:
 TRACKS_TEXT = "🎯 <b>Выберите уровень подготовки:</b>"
 
 
-def tracks_markup():
+def tracks_markup(user_id: int):
     builder = InlineKeyboardBuilder()
     for key, track in TRACKS.items():
         builder.button(text=track["title"], callback_data=f"track:{key}")
+    mistakes_left = len(get_mistakes(user_id))
+    if mistakes_left:
+        builder.button(text=f"{MISTAKES_BUTTON} · {mistakes_left}", callback_data="mistakes")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -547,13 +591,13 @@ async def show_menu(callback: CallbackQuery, text: str, markup) -> None:
 @dp.message(F.text == QUIZ_BUTTON)
 async def cmd_quiz(message: Message) -> None:
     touch_user(message.from_user.id, message.from_user.full_name)
-    await message.answer(TRACKS_TEXT, reply_markup=tracks_markup())
+    await message.answer(TRACKS_TEXT, reply_markup=tracks_markup(message.from_user.id))
 
 
 @dp.callback_query(F.data == "tracks")
 async def back_to_tracks(callback: CallbackQuery) -> None:
     await callback.answer()
-    await show_menu(callback, TRACKS_TEXT, tracks_markup())
+    await show_menu(callback, TRACKS_TEXT, tracks_markup(callback.from_user.id))
 
 
 @dp.callback_query(F.data.startswith("track:"))
