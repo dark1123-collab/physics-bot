@@ -7,7 +7,10 @@ python tools/redraw/compare.py t1_v_15_to_m15 [ещё имена...]
 import os
 import sys
 
-from PIL import Image, ImageDraw
+import matplotlib
+from PIL import Image, ImageDraw, ImageFont
+
+FONT = ImageFont.truetype(os.path.join(matplotlib.get_data_path(), "fonts", "ttf", "DejaVuSans.ttf"), 28)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,8 +31,8 @@ def compare(name, h=600):
     out.paste(new, (old.width + 30, 50))
     d = ImageDraw.Draw(out)
     d.line([(old.width + 15, 0), (old.width + 15, h + 50)], fill="#999999", width=3)
-    d.text((10, 10), "БЫЛО", fill="black")
-    d.text((old.width + 40, 10), "СТАЛО", fill="black")
+    d.text((10, 8), "БЫЛО", fill="black", font=FONT)
+    d.text((old.width + 40, 8), "СТАЛО", fill="black", font=FONT)
     os.makedirs(os.path.join(HERE, "compare"), exist_ok=True)
     out.save(os.path.join(HERE, "compare", name + ".png"))
 

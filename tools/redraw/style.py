@@ -206,3 +206,138 @@ def dial_meter(scales, needle_value, scale_index, letter, terminals, connected, 
     ax.set_xlim(-3.4, 3.4)
     ax.set_ylim(-3.7, 3.3)
     return fig, ax
+
+
+def _arc_scale(ax, cx, cy, R, a0, a1, lo, hi, major, minor, labels=True, inside=False, fmt=None, lw=1.4,
+               label_r=None):
+    """Дуговая шкала: значения lo…hi от угла a0 до a1 (градусы), штрихи наружу (или внутрь)."""
+    ax.add_patch(Arc((cx, cy), 2 * R, 2 * R, theta1=min(a0, a1), theta2=max(a0, a1), color=INK, lw=lw))
+    n = round((hi - lo) / major * minor)
+    sgn = -1 if inside else 1
+    for k in range(n + 1):
+        v = lo + k * major / minor
+        ang = math.radians(a0 + (a1 - a0) * (v - lo) / (hi - lo))
+        is_major = k % minor == 0
+        half = minor % 2 == 0 and k % (minor // 2) == 0
+        L = 0.24 if is_major else (0.17 if half else 0.11)
+        ax.plot([cx + R * math.cos(ang), cx + (R + sgn * L) * math.cos(ang)],
+                [cy + R * math.sin(ang), cy + (R + sgn * L) * math.sin(ang)],
+                color=INK, lw=1.6 if is_major else 0.9)
+        if is_major and labels:
+            r = label_r or (R + sgn * 0.5)
+            ax.text(cx + r * math.cos(ang), cy + r * math.sin(ang), (fmt or _num)(v),
+                    ha="center", va="center", fontsize=FONT - 1)
+
+
+def barometer(value_mm, inner, size=(6.2, 6.2)):
+    """Барометр-анероид: внешняя шкала 730…790 мм рт. ст. (цена деления 1), внутренняя — в inner ("кПа" или "гПа").
+    Стрелка — на value_mm."""
+    fig, ax = plt.subplots(figsize=size)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.add_patch(Circle((0, 0), 3.55, fc="#f8fafc", ec=INK, lw=LW * 1.3))
+    a0, a1 = 225, -45                      # 730 мм — слева внизу, 790 — справа внизу
+    lo, hi = 730, 790
+    _arc_scale(ax, 0, 0, 2.75, a0, a1, lo, hi, 10, 10, label_r=2.3)
+    ax.text(0, -2.55, "мм рт. ст.", ha="center", va="center", fontsize=FONT - 1, color=MUTED)
+    # внутренняя шкала в тех же углах: давление p_mm ↔ p_inner
+    k = 0.133322 if inner == "кПа" else 1.33322
+    ilo, ihi = lo * k, hi * k
+    if inner == "кПа":
+        first, step, minor = 98, 1, 5
+    else:
+        first, step, minor = 980, 10, 5
+    ang = lambda v: a0 + (a1 - a0) * (v - ilo) / (ihi - ilo)  # noqa: E731
+    R = 1.85
+    ax.add_patch(Arc((0, 0), 2 * R, 2 * R, theta1=a1, theta2=a0, color=INK, lw=1.2))
+    v = first
+    while v <= ihi + 1e-9:
+        for j in range(minor):
+            vv = v + j * step / minor
+            if ilo <= vv <= ihi:
+                t = math.radians(ang(vv))
+                L = 0.2 if j == 0 else 0.1
+                ax.plot([R * math.cos(t), (R - L) * math.cos(t)], [R * math.sin(t), (R - L) * math.sin(t)],
+                        color=INK, lw=1.4 if j == 0 else 0.8)
+        if ilo <= v <= ihi:
+            t = math.radians(ang(v))
+            ax.text((R - 0.48) * math.cos(t), (R - 0.48) * math.sin(t), _num(v), ha="center", va="center",
+                    fontsize=FONT - 3)
+        v += step
+    ax.text(0, -0.8, inner, ha="center", va="center", fontsize=FONT - 1, color=MUTED)
+    t = math.radians(a0 + (a1 - a0) * (value_mm - lo) / (hi - lo))
+    ax.plot([-0.5 * math.cos(t), 2.85 * math.cos(t)], [-0.5 * math.sin(t), 2.85 * math.sin(t)],
+            color=ACCENT, lw=3, solid_capstyle="round", zorder=5)
+    ax.add_patch(Circle((0, 0), 0.18, fc=INK, zorder=6))
+    ax.set_xlim(-3.8, 3.8)
+    ax.set_ylim(-3.8, 3.8)
+    return fig, ax
+
+
+def thermometer_h(lo, hi, value, minor=10, size=(9, 1.9), mark=None):
+    """Горизонтальный медицинский термометр: шкала lo…hi °C, деления 1/minor, столбик до value."""
+    fig, ax = plt.subplots(figsize=size)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    L = hi - lo
+    sx = 8.0 / L                        # масштаб: всю шкалу — на 8 единиц
+    x = lambda v: (v - lo) * sx          # noqa: E731
+    ax.add_patch(FancyBboxPatch((x(lo) - 1.4, -1.0), 8.0 + 2.6, 1.85, boxstyle="round,pad=0,rounding_size=0.5",
+                                fc="#f8fafc", ec=INK, lw=LW))
+    ax.add_patch(Circle((x(lo) - 0.95, 0.15), 0.32, fc=ACCENT, ec=INK, lw=1.4, zorder=3))
+    ax.add_patch(Rectangle((x(lo) - 0.7, 0.07), x(value) - x(lo) + 0.7, 0.16, fc=ACCENT, ec="none", zorder=3))
+    ax.add_patch(Rectangle((x(lo) - 0.7, 0.07), 8.0 + 0.9, 0.16, fc="none", ec=INK, lw=0.9, zorder=3))
+    for k in range(L * minor + 1):
+        v = lo + k / minor
+        major = k % minor == 0
+        half = k % (minor // 2) == 0
+        h = 0.32 if major else (0.24 if half else 0.15)
+        ax.plot([x(v), x(v)], [-0.05, -0.05 - h], color=INK, lw=1.4 if major else 0.8)
+        if major:
+            ax.text(x(v), -0.48, _num(v), ha="center", va="top", fontsize=FONT - 1)
+    if mark is not None:
+        ax.add_patch(Polygon([(x(mark) - 0.09, 0.62), (x(mark) + 0.09, 0.62), (x(mark), 0.42)], fc="#dc2626"))
+    ax.text(x(hi) + 0.65, -0.48, "°C", ha="center", va="top", fontsize=FONT - 1)
+    ax.set_xlim(x(lo) - 1.6, x(hi) + 1.4)
+    ax.set_ylim(-1.2, 1.0)
+    return fig, ax
+
+
+def dynamometer(ax, x0, top, hi, step, minor, length, label, value=0):
+    """Вертикальный школьный динамометр на ax: шкала 0…hi Н длиной length, ограничитель сразу под шкалой.
+    Возвращает y ограничителя."""
+    w = 1.9
+    z = top - 1.3                        # ноль шкалы
+    stop_y = z - length - 0.3
+    bottom = stop_y - 0.55
+    ax.add_patch(FancyBboxPatch((x0 - w / 2, bottom), w, top - bottom, boxstyle="round,pad=0,rounding_size=0.12",
+                                fc="#f8fafc", ec=INK, lw=LW))
+    ax.add_patch(Rectangle((x0 - 0.12, top), 0.24, 0.35, fc="white", ec=INK, lw=1.4))   # подвес
+    sx = x0 - 0.35                      # ось пружины и указателя
+    n = 10
+    ys = [top - 0.1 - i * (1.0 / n) for i in range(n + 1)]
+    xs = [sx + (0.17 if i % 2 else -0.17) for i in range(n + 1)]
+    xs[0] = xs[-1] = sx
+    ax.plot([x0, sx], [top, top - 0.1], color=INK, lw=1.2)
+    ax.plot(xs, ys, color=INK, lw=1.4)
+    yv = z - value / hi * length
+    ax.plot([sx, sx], [ys[-1], yv], color=INK, lw=1.2)
+    ax.add_patch(Polygon([(sx - 0.2, yv + 0.06), (sx + 0.32, yv + 0.06), (sx + 0.32, yv - 0.06), (sx - 0.2, yv - 0.06)],
+                         fc=ACCENT, ec=INK, lw=0.8, zorder=4))
+    k_total = round(hi / step * minor)
+    for k in range(k_total + 1):
+        v = k * step / minor
+        y = z - v / hi * length
+        major = k % minor == 0
+        L = 0.24 if major else 0.13
+        ax.plot([x0 + 0.05, x0 + 0.05 + L], [y, y], color=INK, lw=1.3 if major else 0.8)
+        if major:
+            ax.text(x0 + 0.36, y, _num(v), ha="left", va="center", fontsize=FONT - 4)
+    ax.text(x0 + 0.5, top - 0.55, label, ha="center", va="center", fontsize=FONT - 3, fontweight="bold")
+    # ограничитель — планка под последним делением, стержень с крючком проходит через неё
+    ax.add_patch(Rectangle((sx - 0.4, stop_y - 0.09), 0.8, 0.18, fc=INK, ec=INK, zorder=4))
+    hook_top = bottom - 0.45
+    ax.plot([sx, sx], [yv, hook_top], color=INK, lw=1.2)
+    ax.add_patch(Arc((sx + 0.15, hook_top), 0.3, 0.3, theta1=180, theta2=360, color=INK, lw=1.6))
+    ax.plot([sx + 0.3, sx + 0.3], [hook_top, hook_top + 0.12], color=INK, lw=1.6)
+    return stop_y
