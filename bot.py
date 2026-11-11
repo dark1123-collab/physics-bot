@@ -1104,7 +1104,9 @@ async def cmd_stats(message: Message) -> None:
         if s["total"] > 0:
             pct = round(s["correct"] / s["total"] * 100)
             lines.append(f"{section_title(db_key)}: <b>{s['correct']}/{s['total']}</b> ({pct}%)")
-    breakdown = "\n".join(lines)
+    # Абзацы по 20 строк: если разделов много и текст не влезает в одно
+    # сообщение (4096), split_message разрежет его по этим границам.
+    breakdown = "\n\n".join("\n".join(lines[i:i + 20]) for i in range(0, len(lines), 20))
     mistakes_left = len(get_mistakes(message.from_user.id))
     stats_markup = InlineKeyboardBuilder()
     if mistakes_left:
@@ -1112,7 +1114,7 @@ async def cmd_stats(message: Message) -> None:
     stats_markup.button(text=DONATE_BUTTON, callback_data="donate")
     stats_markup.adjust(1)
 
-    await message.answer(
+    text = (
         "📊 <b>Твоя статистика</b>\n\n"
         f"{progress_bar(stats['correct'], stats['total'])}\n"
         f"Отвечено вопросов: <b>{stats['total']}</b>\n"
@@ -1121,9 +1123,11 @@ async def cmd_stats(message: Message) -> None:
         f"{streak_line}\n"
         f"🔁 Ошибок к разбору: <b>{mistakes_left}</b>\n\n"
         f"{result_tier(accuracy)}\n\n"
-        f"📚 <b>По разделам:</b>\n{breakdown}",
-        reply_markup=stats_markup.as_markup(),
+        f"📚 <b>По разделам:</b>\n{breakdown}"
     )
+    chunks = split_message(text)
+    for i, chunk in enumerate(chunks):
+        await message.answer(chunk, reply_markup=stats_markup.as_markup() if i == len(chunks) - 1 else None)
 
 
 # ───────────── Поддержка бота звёздами (Telegram Stars) ─────────────
