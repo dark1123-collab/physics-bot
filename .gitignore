@@ -5,3 +5,5 @@ formula_cache/
 backup_before_formula_images/
 .claude/
 local_config.py
+tools/redraw/preview/
+tools/redraw/compare/
