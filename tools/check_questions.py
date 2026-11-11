@@ -117,7 +117,12 @@ for track_key, track in Q.TRACKS.items():
 
 for where_list in seen.values():
     if len(where_list) > 1:
-        warnings.append("одинаковый текст: " + ", ".join(where_list))
+        sections = [w.split("#")[0] for w in where_list]
+        if len(set(sections)) < len(sections):
+            # Повтор внутри одного раздела — почти наверняка вопросы дописали в файл дважды.
+            errors.append("один вопрос дважды в разделе: " + ", ".join(where_list))
+        else:
+            warnings.append("одинаковый текст: " + ", ".join(where_list))
 
 print(f"Проверено вопросов: {total}")
 for w in warnings:
