@@ -341,3 +341,194 @@ def dynamometer(ax, x0, top, hi, step, minor, length, label, value=0):
     ax.add_patch(Arc((sx + 0.15, hook_top), 0.3, 0.3, theta1=180, theta2=360, color=INK, lw=1.6))
     ax.plot([sx + 0.3, sx + 0.3], [hook_top, hook_top + 0.12], color=INK, lw=1.6)
     return stop_y
+
+
+# ───────────── универсальный холст для графиков ─────────────
+
+class Plot:
+    """Оси со стрелками, сетка, подписи делений, линии, точки, выноски.
+    Координаты — в единицах графика. Ноль осей — в (x0, y0) (по умолчанию (0, 0))."""
+
+    def __init__(self, xlim, ylim, size=(7, 4.6), x0=0, y0=0, grid_x=(), grid_y=(), aspect=None):
+        self.fig, self.ax = plt.subplots(figsize=size)
+        self.ax.axis("off")
+        self.xlim, self.ylim, self.x0, self.y0 = xlim, ylim, x0, y0
+        self.dx = (xlim[1] - xlim[0]) * 0.07
+        self.dy = (ylim[1] - ylim[0]) * 0.09
+        gx0 = grid_x[0] if grid_x else xlim[0]
+        gx1 = grid_x[-1] if grid_x else xlim[1]
+        gy0 = grid_y[0] if grid_y else ylim[0]
+        gy1 = grid_y[-1] if grid_y else ylim[1]
+        for x in grid_x:
+            self.ax.plot([x, x], [gy0, gy1], color=GRID, lw=1, zorder=0)
+        for y in grid_y:
+            self.ax.plot([gx0, gx1], [y, y], color=GRID, lw=1, zorder=0)
+        if aspect:
+            self.ax.set_aspect(aspect)
+
+    def axes(self, xlabel, ylabel, origin="0", xneg=None, yneg=None):
+        """xneg/yneg — откуда начинать ось слева/снизу (для отрицательных значений)."""
+        x_from = xneg if xneg is not None else self.x0
+        y_from = yneg if yneg is not None else self.y0
+        self.ax.annotate("", xy=(self.xlim[1] + self.dx, self.y0), xytext=(x_from, self.y0),
+                         arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.6, mutation_scale=16), zorder=2)
+        self.ax.annotate("", xy=(self.x0, self.ylim[1] + self.dy), xytext=(self.x0, y_from),
+                         arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.6, mutation_scale=16), zorder=2)
+        # подпись оси x — над концом стрелки, чтобы не слипалась с последним делением
+        self.ax.text(self.xlim[1] + self.dx, self.y0 + self.dy * 0.3, xlabel, ha="center", va="bottom")
+        self.ax.text(self.x0 + self.dx * 0.25, self.ylim[1] + self.dy * 1.05, ylabel, ha="left", va="center")
+        if origin:
+            if yneg is not None and yneg < self.y0:
+                # ниже нуля есть подписи — ставим «0» слева на уровне оси
+                self.ax.text(self.x0 - self.dx * 0.25, self.y0, origin, ha="right", va="center",
+                             fontsize=FONT - 1)
+            else:
+                self.ax.text(self.x0 - self.dx * 0.18, self.y0 - self.dy * 0.2, origin, ha="right", va="top",
+                             fontsize=FONT - 1)
+
+    def xticks(self, ticks, labels=None, mark=True):
+        for i, x in enumerate(ticks):
+            lab = labels[i] if labels else _num(x)
+            if mark:
+                self.ax.plot([x, x], [self.y0 - self.dy * 0.12, self.y0 + self.dy * 0.12], color=INK, lw=1.4)
+            self.ax.text(x, self.y0 - self.dy * 0.3, lab, ha="center", va="top", fontsize=FONT - 1)
+
+    def yticks(self, ticks, labels=None, mark=True):
+        for i, y in enumerate(ticks):
+            lab = labels[i] if labels else _num(y)
+            if mark:
+                self.ax.plot([self.x0 - self.dx * 0.12, self.x0 + self.dx * 0.12], [y, y], color=INK, lw=1.4)
+            self.ax.text(self.x0 - self.dx * 0.25, y, lab, ha="right", va="center", fontsize=FONT - 1)
+
+    def line(self, pts, color=ACCENT, lw=None, dashed=False, zorder=3):
+        xs, ys = zip(*pts)
+        self.ax.plot(xs, ys, color=color, lw=lw or LW + 0.6, ls=(0, (5, 4)) if dashed else "-",
+                     solid_capstyle="round", zorder=zorder)
+
+    def curve(self, fn, a, b, n=300, **kw):
+        self.line([(a + (b - a) * i / n, fn(a + (b - a) * i / n)) for i in range(n + 1)], **kw)
+
+    def guide(self, x, y, to_x=True, to_y=True):
+        """Пунктирные выноски от точки к осям."""
+        if to_x:
+            self.ax.plot([x, x], [self.y0, y], color=MUTED, lw=1.1, ls=(0, (4, 4)), zorder=1)
+        if to_y:
+            self.ax.plot([self.x0, x], [y, y], color=MUTED, lw=1.1, ls=(0, (4, 4)), zorder=1)
+
+    def point(self, x, y, label=None, dx=0.0, dy=0.0, ha="left", va="bottom", color=ACCENT):
+        self.ax.plot(x, y, "o", color=color, ms=7, zorder=5)
+        if label:
+            self.ax.text(x + dx, y + dy, label, ha=ha, va=va, fontsize=FONT, color=INK, zorder=6)
+
+    def arrow_mid(self, p1, p2, frac=0.55, color=ACCENT):
+        """Стрелка направления процесса на отрезке p1→p2."""
+        mx, my = p1[0] + (p2[0] - p1[0]) * frac, p1[1] + (p2[1] - p1[1]) * frac
+        ex, ey = p1[0] + (p2[0] - p1[0]) * (frac + 0.01), p1[1] + (p2[1] - p1[1]) * (frac + 0.01)
+        self.ax.annotate("", xy=(ex, ey), xytext=(mx, my),
+                         arrowprops=dict(arrowstyle="-|>", color=color, lw=0, mutation_scale=22), zorder=6)
+
+    def text(self, x, y, s, **kw):
+        kw.setdefault("fontsize", FONT)
+        self.ax.text(x, y, s, **kw)
+
+    def break_y(self, y):
+        """Значок разрыва оси y."""
+        self.ax.text(self.x0, y, "≈", ha="center", va="center", fontsize=FONT + 2,
+                     bbox=dict(fc="white", ec="none", pad=0.5), zorder=4)
+
+    def break_x(self, x):
+        self.ax.text(x, self.y0, "≈", ha="center", va="center", fontsize=FONT + 2, rotation=90,
+                     bbox=dict(fc="white", ec="none", pad=0.5), zorder=4)
+
+    def finish(self, path, extra=0.0):
+        self.ax.set_xlim(self.xlim[0] - self.dx * (1.2 + extra), self.xlim[1] + self.dx * 1.8)
+        self.ax.set_ylim(self.ylim[0] - self.dy * 1.2, self.ylim[1] + self.dy * 1.8)
+        save(self.fig, path)
+
+
+# ───────────── механические схемы ─────────────
+
+def canvas(size=(7, 4), xlim=None, ylim=None):
+    fig, ax = plt.subplots(figsize=size)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    if xlim:
+        ax.set_xlim(*xlim)
+    if ylim:
+        ax.set_ylim(*ylim)
+    return fig, ax
+
+
+def hatch(ax, x1, x2, y, down=True, step=0.25, lw=1.3):
+    """Опора/пол: линия с косой штриховкой (снизу при down=True)."""
+    ax.plot([x1, x2], [y, y], color=INK, lw=LW, zorder=2)
+    s = -1 if down else 1
+    x = x1
+    while x < x2 - 1e-9:
+        ax.plot([x, x + step * 0.8], [y + s * step * 0.8, y], color=INK, lw=lw, zorder=1)
+        x += step
+
+
+def hatch_v(ax, x, y1, y2, left=True, step=0.25, lw=1.3):
+    """Вертикальная стена со штриховкой слева (left=True) или справа."""
+    ax.plot([x, x], [y1, y2], color=INK, lw=LW, zorder=2)
+    s = -1 if left else 1
+    y = y1
+    while y < y2 - 1e-9:
+        ax.plot([x + s * step * 0.8, x], [y, y + step * 0.8], color=INK, lw=lw, zorder=1)
+        y += step
+
+
+def spring(ax, x1, x2, y, coils=8, amp=0.18, lead=0.15, lw=1.6):
+    """Горизонтальная пружина от x1 до x2."""
+    pts = [(x1, y), (x1 + lead, y)]
+    L = x2 - x1 - 2 * lead
+    for i in range(coils * 2):
+        pts.append((x1 + lead + L * (i + 0.5) / (coils * 2), y + (amp if i % 2 == 0 else -amp)))
+    pts += [(x2 - lead, y), (x2, y)]
+    xs, ys = zip(*pts)
+    ax.plot(xs, ys, color=INK, lw=lw, zorder=2)
+
+
+def block(ax, x, y, w, h, label=None, fc=FILL, angle=0, fontsize=None):
+    """Брусок: (x, y) — левый нижний угол (до поворота на angle вокруг него)."""
+    import matplotlib.transforms as mtransforms
+    p = Rectangle((x, y), w, h, fc=fc, ec=INK, lw=LW, zorder=3)
+    if angle:
+        p.set_transform(mtransforms.Affine2D().rotate_deg_around(x, y, angle) + ax.transData)
+    ax.add_patch(p)
+    if label:
+        c, s = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+        cx, cy = x + (w / 2) * c - (h / 2) * s, y + (w / 2) * s + (h / 2) * c
+        ax.text(cx, cy, label, ha="center", va="center", fontsize=fontsize or FONT + 2, rotation=angle,
+                style="italic", zorder=4)
+
+
+def ball(ax, x, y, r, label=None, fc=FILL):
+    ax.add_patch(Circle((x, y), r, fc=fc, ec=INK, lw=LW, zorder=3))
+    if label:
+        ax.text(x, y, label, ha="center", va="center", fontsize=FONT + 1, style="italic", zorder=4)
+
+
+def vec(ax, x1, y1, x2, y2, label=None, lx=0.0, ly=0.0, color=ACCENT, lw=2.4, ha="left", va="center"):
+    """Вектор-стрелка с подписью."""
+    ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                arrowprops=dict(arrowstyle="-|>", color=color, lw=lw, mutation_scale=20, shrinkA=0, shrinkB=0),
+                zorder=5)
+    if label:
+        ax.text(x2 + lx, y2 + ly, label, ha=ha, va=va, fontsize=FONT + 2, color=INK, zorder=6)
+
+
+def cells(ax, x1, y1, nx, ny, step=1.0):
+    """Клетчатая сетка nx×ny с левым нижним углом (x1, y1)."""
+    for i in range(nx + 1):
+        ax.plot([x1 + i * step] * 2, [y1, y1 + ny * step], color=GRID, lw=1, zorder=0)
+    for j in range(ny + 1):
+        ax.plot([x1, x1 + nx * step], [y1 + j * step] * 2, color=GRID, lw=1, zorder=0)
+
+
+def badge(ax, x, y, text, r=0.32):
+    """Метка графика «А»/«Б» в кружке."""
+    # кружок задаётся в пунктах (bbox), а не в координатах — не сплющивается при любом масштабе осей
+    ax.text(x, y, text, ha="center", va="center", color="white", fontsize=FONT, fontweight="bold", zorder=5,
+            bbox=dict(boxstyle="circle,pad=0.25", fc=INK, ec=INK))
